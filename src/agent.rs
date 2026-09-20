@@ -26,7 +26,7 @@ const EFFORTS: [&str; 7] = ["max", "xhigh", "high", "medium", "low", "minimal", 
 pub const COMPACTION_INSTRUCTION: &str = "\
 Compaction/summarization triggered: you must condense the conversation above into a structured checkpoint that lets you resume your work/the story with no essential context.
 
-You still should have all the tools available so that you can record important information into your working directory. At the end of your turn, you must provide a single message that entails all the information that needs to be passed down to the new agent (you with no memory besides the system prompt), so that it can pick up from where you left. New agent will be provided with the same system prompt, the same environment and your message, all the other information will get lost.
+You still should have all the tools available so that you can record important information into your working directory. At the end of your turn, you must provide a single message that entails all the information that needs to be passed down to the new agent (you with no memory besides the system prompt), so that it can pick up from where you left. New agent will be provided with the same system prompt, the same environment (e. g. filesystem) and your last message, all the other information will get lost.
 
 Don't send any Telegram messages unless necessary.
 Be terse and concise.";
@@ -552,6 +552,9 @@ fn format_events(events: &[Event], asleep: Duration) -> (Option<String>, Vec<Str
         text.push_str(&describe_event(e));
         text.push('\n');
         for attachment in &e.attachments {
+            if image_mime(&attachment.path).is_none() {
+                continue;
+            }
             match image_data_url(attachment) {
                 Some(url) => images.push(url),
                 None => text.push_str(&format!(
@@ -564,13 +567,20 @@ fn format_events(events: &[Event], asleep: Duration) -> (Option<String>, Vec<Str
     (Some(text), images)
 }
 
+fn image_mime(path: &Path) -> Option<&'static str> {
+    match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "png" => Some("image/png"),
+        "webp" => Some("image/webp"),
+        "gif" => Some("image/gif"),
+        _ => None,
+    }
+}
+
+/// Embed an attachment as a vision data URL; `None` for non-image files
+/// (they stay file-tool-only) or unreadable ones.
 fn image_data_url(attachment: &Attachment) -> Option<String> {
-    let mime = match attachment.path.extension()?.to_str()? {
-        "png" => "image/png",
-        "webp" => "image/webp",
-        "gif" => "image/gif",
-        _ => "image/jpeg",
-    };
+    let mime = image_mime(&attachment.path)?;
     let bytes = std::fs::read(&attachment.path).ok()?;
     Some(Telegram::image_data_url(&bytes, mime))
 }
@@ -651,5 +661,19 @@ mod tests {
         assert!(!is_model_command(&event_with_text("/modelx low")));
         assert!(!is_model_command(&event_with_text("story text /model")));
         assert!(!is_model_command(&event_with_text("/ping")));
+    }
+
+    #[test]
+    fn image_embedding_is_extension_gated() {
+        let dir = std::env::temp_dir().join("rp-agent-tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        let png = dir.join("pic.PNG");
+        std::fs::write(&png, b"not really png but bytes").unwrap();
+        let txt = dir.join("note.txt");
+        std::fs::write(&txt, b"plain text").unwrap();
+
+        let att = |p: &std::path::Path| Attachment { path: p.to_path_buf(), is_image: false };
+        assert!(image_data_url(&att(&png)).unwrap().starts_with("data:image/png;base64,"));
+        assert_eq!(image_data_url(&att(&txt)), None);
     }
 }

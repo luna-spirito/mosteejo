@@ -104,7 +104,7 @@ fn send_message_schema() -> Value {
         "send_message",
         "Send a Telegram message. Long texts are split automatically. Plain text by default.",
         json!({
-            "chat_id": { "type": "integer", "description": "Target chat id (a user id for DMs, a negative id for groups)." },
+            "chat_id": { "type": "integer", "description": "Target chat id (a user id for DMs, a negative id for groups). Note that any message sent to the user's DM won't be visible for other users." },
             "thread_id": { "type": "integer", "description": "Forum topic (message_thread_id) to post into, if the chat has topics." },
             "text": { "type": "string" },
             "parse_mode": { "type": "string", "description": "Optional: HTML, MarkdownV2 or Markdown." },
@@ -114,6 +114,7 @@ fn send_message_schema() -> Value {
     )
 }
 
+#[allow(dead_code)] // disabled in schemas() for now, kept for easy re-enable
 fn send_typing_schema() -> Value {
     schema(
         "send_typing",
@@ -456,7 +457,6 @@ mod tests {
             "write_file",
             "edit_file",
             "send_message",
-            "send_typing",
         ] {
             assert!(
                 all.as_array()

@@ -38,14 +38,20 @@ pub struct Reply {
     pub finish_reason: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+struct PromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
 struct Usage {
     #[serde(default)]
     prompt_tokens: u64,
     #[serde(default)]
     completion_tokens: u64,
     #[serde(default)]
-    cached_tokens: u64,
+    prompt_tokens_details: PromptTokensDetails,
 }
 
 #[derive(Debug)]
@@ -151,7 +157,7 @@ impl Llm {
             // actually works against the provider.
             tracing::info!(
                 prompt = u.prompt_tokens,
-                cached = u.cached_tokens,
+                cached = u.prompt_tokens_details.cached_tokens,
                 completion = u.completion_tokens,
                 "llm usage"
             );
