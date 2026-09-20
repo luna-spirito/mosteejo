@@ -23,29 +23,15 @@ pub struct Tools<'a> {
     pub workspace: &'a Path,
 }
 
-pub fn schemas(telegram: bool) -> Value {
-    let mut tools = vec![bash_schema(), read_schema(), write_schema(), edit_schema()];
-    if telegram {
-        tools.push(send_message_schema());
-        // tools.push(send_typing_schema());
-    }
-    Value::Array(tools)
-}
-
-/// Strip a schema set down to the filesystem/terminal half.
-pub fn file_only_schemas(all: &Value) -> Value {
-    Value::Array(
-        all.as_array()
-            .expect("tools array")
-            .iter()
-            .filter(|t| {
-                t["function"]["name"]
-                    .as_str()
-                    .is_some_and(|n| !n.starts_with("send_"))
-            })
-            .cloned()
-            .collect(),
-    )
+pub fn schemas() -> Value {
+    Value::Array(vec![
+        bash_schema(),
+        read_schema(),
+        write_schema(),
+        edit_schema(),
+        send_message_schema(),
+        // send_typing_schema(),
+    ])
 }
 
 fn bash_schema() -> Value {
@@ -452,8 +438,8 @@ mod tests {
     }
 
     #[test]
-    fn schemas_and_file_only_filter() {
-        let all = schemas(true);
+    fn schemas_list_every_tool() {
+        let all = schemas();
         for name in [
             "bash",
             "read_file",
@@ -469,9 +455,6 @@ mod tests {
                 "missing {name}"
             );
         }
-        let files = file_only_schemas(&all);
-        assert_eq!(files.as_array().unwrap().len(), 4);
-        assert!(schemas(false).as_array().unwrap().len() == 4);
     }
 
     #[test]

@@ -211,6 +211,17 @@ impl Session {
         &self.surface
     }
 
+    /// Estimated tokens of `surface[from..]`. Combined with the provider's
+    /// real `prompt_tokens` for the prefix before `from`, this tracks the
+    /// context size: exact where it matters (the stable prefix), heuristic
+    /// only for the short fresh tail.
+    pub fn tail_tokens(&self, from: usize) -> u64 {
+        self.surface[from.min(self.surface.len())..]
+            .iter()
+            .map(message_tokens)
+            .sum()
+    }
+
     pub fn append(&mut self, message: Message) -> Result<()> {
         Self::write(&mut self.log, &Op::Append { message: message.clone() })?;
         self.surface.push(message);
@@ -261,6 +272,21 @@ mod tests {
         assert!(surface[1].text.contains("<compacted-summary>"));
         assert_eq!(surface[2].text, "hello");
         assert_eq!(surface[3].text, "more");
+    }
+
+    #[test]
+    fn tail_tokens_counts_only_the_tail() {
+        let ops = vec![
+            Op::Append { message: Message::system("sys") },
+            Op::Append { message: Message::user("0123456789".repeat(40)) }, // 400 chars
+            Op::Append { message: Message::user("x") },
+        ];
+        let log = std::fs::File::create(std::env::temp_dir().join("rp-tail-tokens.jsonl")).unwrap();
+        let session = Session { surface: replay(ops), log };
+        let (head, tail) = (session.tail_tokens(2), session.tail_tokens(0));
+        assert!(head < tail);
+        assert_eq!(head, message_tokens(&Message::user("x")));
+        assert_eq!(session.tail_tokens(99), 0);
     }
 
     #[test]

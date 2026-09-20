@@ -36,6 +36,10 @@ pub struct Reply {
     pub reasoning: String,
     pub tool_calls: Vec<ToolCall>,
     pub finish_reason: Option<String>,
+    /// Prompt tokens as counted by the provider — the ground truth that
+    /// compaction triggering is anchored to (our own estimate is only used
+    /// for the tail appended after the response).
+    pub prompt_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
@@ -177,6 +181,7 @@ impl Llm {
                 })
                 .collect(),
             finish_reason: choice.finish_reason,
+            prompt_tokens: usage.map(|u| u.prompt_tokens),
         })
     }
 }

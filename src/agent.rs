@@ -26,15 +26,13 @@ const EFFORTS: [&str; 7] = ["max", "xhigh", "high", "medium", "low", "minimal", 
 pub const COMPACTION_INSTRUCTION: &str = "\
 Compaction/summarization triggered: you must condense the conversation above into a structured checkpoint that lets you resume your work/the story with no essential context.
 
-You still should have all the tools available so that you can record important information into your working directory. At the end of your turn, you must provide a single message that entails all the information that needs to be passed down to the new agent (you with no memory besides the system prompt), so that it can pick up from where you left. New agent will be provided with the same system prompt, the same environment (e. g. filesystem) and your last message, all the other information will get lost.
+You still should have all the tools available so that you can record important information into your working directory. At the end of your turn, you must provide a single message that entails all the information that needs to be passed down to the new agent (you with no memory besides the system prompt), so that it can pick up from where you left. New agent will be provided with the same system prompt, the same environment (e. g. filesystem) and the message, all the other information will get lost.
 
 Don't send any Telegram messages unless necessary.
 Be terse and concise.";
 
 const HEARTBEAT: &str = "\
 [tick] Scheduled wake, no new Telegram messages. You may take autonomous actions (advance a scene, act for NPCs, tidy up your notes) or do nothing at all. You probably shouldn't overthink and just do nothing at all.";
-
-const MAX_SUMMARIZER_STEPS: usize = 20;
 
 /// Model + reasoning effort currently driving the main loop. Overridable at
 /// runtime via `/model`, persisted in the state dir across restarts.
@@ -173,9 +171,13 @@ pub struct Agent {
     inbox: Inbox,
     watch: WatchList,
     schemas: Value,
-    file_schemas: Value,
     choice: ModelChoice,
     last_wake: Instant,
+    /// Compaction metric anchor: the provider's real `prompt_tokens` for the
+    /// surface as of length `usize`; the metric adds an estimate of the tail
+    /// appended since. `None` before the first response (and right after a
+    /// compaction) falls back to the pure estimate.
+    prompt_anchor: Option<(usize, u64)>,
 }
 
 impl Agent {
@@ -187,8 +189,7 @@ impl Agent {
         inbox: Inbox,
         watch: WatchList,
     ) -> Self {
-        let schemas = crate::tools::schemas(true);
-        let file_schemas = crate::tools::file_only_schemas(&schemas);
+        let schemas = crate::tools::schemas();
         let choice = ModelChoice::load(
             &cfg.agent.state_dir,
             &cfg.llm.model,
@@ -203,9 +204,9 @@ impl Agent {
             inbox,
             watch,
             schemas,
-            file_schemas,
             choice,
             last_wake: Instant::now(),
+            prompt_anchor: None,
         }
     }
 
@@ -339,26 +340,23 @@ impl Agent {
         }
     }
 
-    fn tools(&self, file_only: bool) -> Tools<'_> {
+    fn tools(&self) -> Tools<'_> {
         Tools {
-            tg: (!file_only).then_some(&self.tg),
+            tg: Some(&self.tg),
             workspace: &self.cfg.agent.workspace_dir,
         }
     }
 
     async fn run_turn(&mut self) -> Result<()> {
         loop {
-            self.maybe_compact(false).await?;
-            let reply = match self
-                .llm
-                .chat(self.session.surface(), &self.schemas, &self.chat_options())
-                .await
-            {
+            let reply = match self.request().await {
                 Ok(reply) => reply,
                 Err(ChatError::ContextOverflow(e)) => {
                     tracing::warn!(error = %e, "context overflow; compacting aggressively and retrying once");
                     self.maybe_compact(true).await?;
-                    self.request().await?
+                    self.request()
+                        .await
+                        .map_err(|e| anyhow!("llm request failed: {e}"))?
                 }
                 Err(e) => return Err(anyhow!("llm request failed: {e}")),
             };
@@ -372,24 +370,36 @@ impl Agent {
             }
             self.session.append(assistant)?;
             if reply.tool_calls.is_empty() {
+                // Turn over and nobody is waiting: compact here, in the
+                // pause, so the next user message never pays for it. The
+                // real prompt_tokens of the last request are already
+                // anchored.
+                self.maybe_compact(false).await?;
                 return Ok(());
             }
             self.dispatch(&reply.tool_calls).await?;
         }
     }
 
-    async fn request(&mut self) -> Result<Reply> {
-        self.llm
+    /// One model request. On success anchors the compaction metric to the
+    /// provider's own token count for this exact surface state.
+    async fn request(&mut self) -> Result<Reply, ChatError> {
+        let mark = self.session.surface().len();
+        let reply = self
+            .llm
             .chat(self.session.surface(), &self.schemas, &self.chat_options())
-            .await
-            .map_err(|e| anyhow!("llm request failed: {e}"))
+            .await?;
+        if let Some(p) = reply.prompt_tokens {
+            self.prompt_anchor = Some((mark, p));
+        }
+        Ok(reply)
     }
 
     async fn dispatch(&mut self, calls: &[ToolCall]) -> Result<()> {
         for call in calls {
             let started = Instant::now();
             let out = match crate::tools::parse_arguments(&call.arguments) {
-                Ok(args) => self.tools(false).execute(&call.name, args).await,
+                Ok(args) => self.tools().execute(&call.name, args).await,
                 Err(e) => format!("Error: {e}"),
             };
             tracing::info!(tool = %call.name, ms = started.elapsed().as_millis() as u64, "tool finished");
@@ -399,12 +409,18 @@ impl Agent {
         Ok(())
     }
 
-    /// Compact when the estimated token total crosses the threshold. With
-    /// `force` (context-overflow recovery) the retained tail shrinks and the
-    /// threshold is bypassed. Compaction failure is logged, never fatal: the
-    /// turn continues with the uncompacted surface.
+    /// Compact when the token total crosses the threshold. The total is the
+    /// provider's real `prompt_tokens` from the last request plus an estimate
+    /// of the tail appended since; before any response (and right after a
+    /// compaction) it is a pure estimate. With `force` (context-overflow
+    /// recovery) the retained tail shrinks and the threshold is bypassed.
+    /// Compaction failure is logged, never fatal: the turn continues with the
+    /// uncompacted surface.
     async fn maybe_compact(&mut self, force: bool) -> Result<()> {
-        let total = estimate_tokens(self.session.surface());
+        let total = match self.prompt_anchor {
+            Some((mark, prompt)) => prompt + self.session.tail_tokens(mark),
+            None => estimate_tokens(self.session.surface()),
+        };
         let threshold = self.cfg.llm.compaction_threshold_tokens;
         if !force && total < threshold {
             return Ok(());
@@ -440,6 +456,8 @@ impl Agent {
             return Ok(());
         }
         self.session.compact(shadowed, summary)?;
+        // The surface was replaced; the anchor described the old one.
+        self.prompt_anchor = None;
         tracing::info!(
             shadowed,
             shadowed_tokens,
@@ -450,16 +468,16 @@ impl Agent {
     }
 
     /// Run the summarizer as a normal agentic loop over a scratch copy of
-    /// the surface: file tools stay available (notes offloading), Telegram
-    /// tools do not. The request replays the surface verbatim, so the
-    /// provider prefix cache stays warm and only the instruction is novel.
+    /// the surface. All tools stay available, including Telegram's. The
+    /// request replays the surface verbatim, so the provider prefix cache
+    /// stays warm and only the instruction is novel.
     async fn summarize(&self) -> Result<String> {
         let mut scratch = self.session.surface().to_vec();
         scratch.push(Message::user(COMPACTION_INSTRUCTION));
-        for _ in 0..MAX_SUMMARIZER_STEPS {
+        loop {
             let reply = self
                 .llm
-                .chat(&scratch, &self.file_schemas, &self.compaction_options())
+                .chat(&scratch, &self.schemas, &self.compaction_options())
                 .await
                 .map_err(|e| anyhow!("summarizer request failed: {e}"))?;
             let calls = reply.tool_calls.clone();
@@ -478,15 +496,12 @@ impl Agent {
             }
             for call in calls {
                 let out = match crate::tools::parse_arguments(&call.arguments) {
-                    Ok(args) => self.tools(true).execute(&call.name, args).await,
+                    Ok(args) => self.tools().execute(&call.name, args).await,
                     Err(e) => format!("Error: {e}"),
                 };
                 scratch.push(Message::tool_result(call.id, out));
             }
         }
-        Err(anyhow!(
-            "summarizer did not converge in {MAX_SUMMARIZER_STEPS} steps"
-        ))
     }
 }
 

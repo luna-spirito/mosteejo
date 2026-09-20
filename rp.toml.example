@@ -41,8 +41,10 @@ reasoning_effort = "low"
 # agents per the Z.ai thinking-mode guide; also improves prefix-cache hits.
 preserve_thinking = true
 
-# Compaction: run the summarizer once the estimated surface exceeds the
-# threshold; keep the last `retain` tokens verbatim.
+# Compaction: run the summarizer once the context exceeds the threshold.
+# The count is the PROVIDER's real prompt_tokens (see `llm usage prompt=` in
+# the log) plus an estimate of the tail appended since — set it relative to
+# the model's actual context window, well below it.
 compaction_threshold_tokens = 48000
 compaction_retain_tokens = 8000
 
