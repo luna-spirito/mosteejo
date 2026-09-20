@@ -1,0 +1,63 @@
+# rp-bot configuration example.
+# Secrets can be given here or via $TELEGRAM_BOT_TOKEN / $ZAI_API_KEY.
+
+[telegram]
+# token = "123456:ABC..."
+# Filled in by getMe if omitted; needed earlier only for mention detection.
+bot_username = "my_rp_bot"
+
+# The bot perceives ONLY these users; every other update is dropped before
+# it can influence the model (prompt-injection hard boundary).
+[[telegram.allowed_users]]
+id = 111111111
+name = "Alice"
+
+[[telegram.allowed_users]]
+id = 222222222
+name = "Bob"
+
+# Topics the bot watches and wakes on immediately.
+[[telegram.subscribed_topics]]
+chat_id = -1001234567890
+thread_id = 42
+
+[[telegram.subscribed_topics]]
+chat_id = -1001234567890
+thread_id = 7
+
+[llm]
+# api_key = "..."
+base_url = "https://api.z.ai/api/paas/v4"
+model = "glm-5.3-flash"
+max_output_tokens = 8192
+# temperature = 0.8
+
+# reasoning_effort for Z.ai; on GLM-5.3* only low | high | max are valid
+# (provider default is `max`). Comment out to send nothing at all.
+reasoning_effort = "low"
+
+# Preserved thinking: store each turn's reasoning_content and replay it
+# verbatim on later requests (`clear_thinking: false`). Required for tool
+# agents per the Z.ai thinking-mode guide; also improves prefix-cache hits.
+preserve_thinking = true
+
+# Compaction: run the summarizer once the estimated surface exceeds the
+# threshold; keep the last `retain` tokens verbatim.
+compaction_threshold_tokens = 48000
+compaction_retain_tokens = 8000
+
+[agent]
+# Inline prompt...
+system_prompt = """
+You are the game master of a tabletop roleplay campaign happening in Telegram.
+"""
+# ...or from a file (wins if both are set):
+# system_prompt_file = "/etc/rp-bot/prompt.md"
+
+workspace_dir = "workspace"
+state_dir = "state"
+
+# Non-priority updates wake the agent on this cadence (seconds).
+idle_wake_secs = 600
+# Send a heartbeat prompt even when nothing happened during the tick.
+heartbeat = true
