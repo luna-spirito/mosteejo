@@ -1,11 +1,13 @@
-//! Conversation state: message surface plus the append-only JSONL log it is
-//! derived from. Compaction never rewrites history — it appends a `Compact`
-//! op that shadows a span of the surface.
+//! Conversation state: the message surface plus the per-session JSONL files
+//! it is derived from. The system prompt lives in config, never in the log;
+//! compaction rotates to a fresh session file seeded with the checkpoint,
+//! so files stay bounded and old generations remain on disk as archives.
+//! `migrate` converts the legacy single-file layout on first load.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Estimated cost of one image block, in model tokens. Rough by design:
 /// the estimate only drives the compaction threshold.
@@ -93,8 +95,9 @@ fn summary_message(summary: &str) -> Message {
     Message::user(format!("{SUMMARY_PREAMBLE}\n\n<compacted-summary>\n{summary}\n</compacted-summary>"))
 }
 
-/// Pure fold of log ops into a surface. `compact` shadows a span but the log
-/// keeps everything, so replaying from scratch always reproduces the state.
+/// Pure fold of log ops into a surface. Legacy-format machinery: old
+/// single-file logs carried the system prompt at index 0 and `Compact` ops
+/// shadowing a span after it; kept only so `migrate` can replay them.
 fn replay(ops: impl IntoIterator<Item = Op>) -> Vec<Message> {
     let mut surface: Vec<Message> = Vec::new();
     for op in ops {
@@ -154,18 +157,13 @@ pub fn message_tokens(m: &Message) -> u64 {
         + m.images.len() as u64 * IMAGE_TOKENS
 }
 
-pub fn estimate_tokens(msgs: &[Message]) -> u64 {
-    msgs.iter().map(message_tokens).sum()
-}
-
-/// Number of entries after the system head that can be shadowed while
-/// keeping a tail worth at least `retain_tokens`. Never splits an
-/// assistant-tool_call / tool-result pair. `None` when there is nothing
-/// meaningful to compact.
+/// Number of leading messages that can be shadowed while keeping a tail
+/// worth at least `retain_tokens`. Never splits an assistant-tool_call /
+/// tool-result pair. `None` when there is nothing meaningful to compact.
 pub fn shadow_count(msgs: &[Message], retain_tokens: u64) -> Option<usize> {
     let mut boundary = msgs.len();
     let mut acc = 0u64;
-    while boundary > 1 {
+    while boundary > 0 {
         let t = message_tokens(&msgs[boundary - 1]);
         if acc > 0 && acc + t > retain_tokens {
             break;
@@ -173,38 +171,93 @@ pub fn shadow_count(msgs: &[Message], retain_tokens: u64) -> Option<usize> {
         acc += t;
         boundary -= 1;
     }
-    while boundary > 1 && msgs[boundary].role == Role::Tool {
+    while boundary > 0 && msgs[boundary].role == Role::Tool {
         boundary -= 1;
     }
-    (boundary > 1).then_some(boundary - 1)
+    (boundary > 0).then_some(boundary)
 }
 
+/// One session file per compaction generation: `state/sessions/<ts>.jsonl`
+/// holds plain `Append` ops of the post-compaction surface, `state/current`
+/// names the active file. The system prompt is never stored — config
+/// supplies it at request time, so a restart applies a new prompt at once.
+/// Compaction rotates to a fresh file seeded with `[checkpoint, tail]`,
+/// which also keeps every file's size bounded.
 pub struct Session {
     surface: Vec<Message>,
-    log: std::fs::File,
+    state_dir: PathBuf,
+    file: Option<(PathBuf, std::fs::File)>,
 }
 
 impl Session {
-    pub fn load(log_path: &Path) -> Result<Self> {
-        let log = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(log_path)
-            .with_context(|| format!("open session log {}", log_path.display()))?;
-        let surface = if log_path.metadata().map(|m| m.len()).unwrap_or(0) == 0 {
-            Vec::new()
-        } else {
-            let file = std::fs::File::open(log_path)
-                .with_context(|| format!("read session log {}", log_path.display()))?;
-            let ops = std::io::BufReader::new(file)
-                .lines()
-                .map(|l| serde_json::from_str::<Op>(&l?).context("decode session log line"))
-                .collect::<Result<Vec<Op>>>()?;
-            let mut surface = replay(ops);
-            repair_dangling_calls(&mut surface);
-            surface
+    pub fn load(state_dir: &Path) -> Result<Self> {
+        let pointer = state_dir.join("current");
+        let (surface, file) = match std::fs::read_to_string(&pointer) {
+            Ok(name) => {
+                let path = state_dir.join("sessions").join(name.trim());
+                let file = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&path)
+                    .with_context(|| format!("open session file {}", path.display()))?;
+                let ops = std::io::BufReader::new(std::fs::File::open(&path)?)
+                    .lines()
+                    .map(|l| serde_json::from_str::<Op>(&l?).context("decode session line"))
+                    .collect::<Result<Vec<Op>>>()?;
+                (replay(ops), Some((path, file)))
+            }
+            Err(_) if state_dir.join("session.jsonl").exists() => {
+                let s = Self::migrate(state_dir)?;
+                return Ok(s);
+            }
+            Err(_) => (Vec::new(), None),
         };
-        Ok(Self { surface, log })
+        let mut surface = surface;
+        repair_dangling_calls(&mut surface);
+        Ok(Self { surface, state_dir: state_dir.to_path_buf(), file })
+    }
+
+    /// Convert a legacy single-file log (system prompt stored at the head,
+    /// `Compact` ops shadowing a span after it) into the per-session layout.
+    /// The stored prompt is dropped; the logical surface is re-seeded into a
+    /// fresh file and the legacy one is renamed aside.
+    fn migrate(state_dir: &Path) -> Result<Self> {
+        let legacy = state_dir.join("session.jsonl");
+        let ops = std::io::BufReader::new(std::fs::File::open(&legacy)?)
+            .lines()
+            .map(|l| serde_json::from_str::<Op>(&l?).context("decode legacy session line"))
+            .collect::<Result<Vec<Op>>>()?;
+        let mut surface = replay(ops);
+        while surface.first().is_some_and(|m| m.role == Role::System) {
+            surface.remove(0);
+        }
+        repair_dangling_calls(&mut surface);
+        let mut session = Self { surface, state_dir: state_dir.to_path_buf(), file: None };
+        let carried = session.surface.clone();
+        session.rotate_into(&carried)?;
+        std::fs::rename(&legacy, state_dir.join("session.jsonl.migrated"))
+            .context("rename legacy session log")?;
+        tracing::info!("migrated legacy session.jsonl into per-session layout");
+        Ok(session)
+    }
+
+    /// Close the current file and make `messages` the content of a fresh one.
+    fn rotate_into(&mut self, messages: &[Message]) -> Result<()> {
+        self.file = None;
+        let dir = self.state_dir.join("sessions");
+        std::fs::create_dir_all(&dir)?;
+        let name = format!(
+            "{}.jsonl",
+            chrono::Utc::now().format("%Y%m%dT%H%M%S%3f")
+        );
+        let path = dir.join(&name);
+        let mut file = std::fs::File::create(&path)
+            .with_context(|| format!("create session file {}", path.display()))?;
+        for m in messages {
+            Self::write(&mut file, &Op::Append { message: m.clone() })?;
+        }
+        std::fs::write(self.state_dir.join("current"), &name)?;
+        self.file = Some((path, file));
+        Ok(())
     }
 
     pub fn surface(&self) -> &[Message] {
@@ -223,14 +276,24 @@ impl Session {
     }
 
     pub fn append(&mut self, message: Message) -> Result<()> {
-        Self::write(&mut self.log, &Op::Append { message: message.clone() })?;
+        if self.file.is_none() {
+            self.rotate_into(&[])?;
+        }
+        let (_, log) = self.file.as_mut().expect("rotated above");
+        Self::write(log, &Op::Append { message: message.clone() })?;
         self.surface.push(message);
         Ok(())
     }
 
+    /// Replace the shadowed prefix with the checkpoint by rotating: the new
+    /// session file starts as `[summary, kept tail…]`, the old file remains
+    /// on disk as an archive generation.
     pub fn compact(&mut self, shadowed: usize, summary: String) -> Result<()> {
-        Self::write(&mut self.log, &Op::Compact { shadowed, summary: summary.clone() })?;
-        apply_op(&mut self.surface, Op::Compact { shadowed, summary });
+        let mut carried = Vec::with_capacity(1 + self.surface.len() - shadowed);
+        carried.push(summary_message(&summary));
+        carried.extend_from_slice(&self.surface[shadowed..]);
+        self.rotate_into(&carried)?;
+        self.surface = carried;
         Ok(())
     }
 
@@ -277,13 +340,15 @@ mod tests {
     #[test]
     fn tail_tokens_counts_only_the_tail() {
         let ops = vec![
-            Op::Append { message: Message::system("sys") },
             Op::Append { message: Message::user("0123456789".repeat(40)) }, // 400 chars
             Op::Append { message: Message::user("x") },
         ];
-        let log = std::fs::File::create(std::env::temp_dir().join("rp-tail-tokens.jsonl")).unwrap();
-        let session = Session { surface: replay(ops), log };
-        let (head, tail) = (session.tail_tokens(2), session.tail_tokens(0));
+        let session = Session {
+            surface: replay(ops),
+            state_dir: std::env::temp_dir(),
+            file: None,
+        };
+        let (head, tail) = (session.tail_tokens(1), session.tail_tokens(0));
         assert!(head < tail);
         assert_eq!(head, message_tokens(&Message::user("x")));
         assert_eq!(session.tail_tokens(99), 0);
@@ -315,49 +380,83 @@ mod tests {
 
     #[test]
     fn shadow_respects_retain_and_pairs() {
-        let mut msgs = vec![Message::system("s")];
-        for i in 0..10 {
-            msgs.push(Message::user(format!("u{i}{}", "x".repeat(400))));
-        }
+        let msgs: Vec<_> = (0..10)
+            .map(|i| Message::user(format!("u{i}{}", "x".repeat(400))))
+            .collect();
         let shadowed = shadow_count(&msgs, 200).unwrap();
         assert!(shadowed > 0 && shadowed < 10);
 
         // A boundary landing between a call and its result moves back.
-        let mut msgs = vec![Message::system("s")];
+        let mut msgs = Vec::new();
         for i in 0..3 {
             msgs.extend(tool_pair(i));
         }
         msgs.push(Message::user("tail"));
         let shadowed = shadow_count(&msgs, 1).unwrap();
-        let kept = &msgs[1 + shadowed];
-        assert_ne!(kept.role, Role::Tool);
+        assert_ne!(msgs[shadowed].role, Role::Tool);
     }
 
     #[test]
-    fn shadow_nothing_when_only_head() {
-        let msgs = vec![Message::system("s"), Message::user("only")];
-        assert_eq!(shadow_count(&msgs, 1), None);
+    fn shadow_none_when_nothing_to_shadow() {
+        assert_eq!(shadow_count(&[Message::user("only")], 1), None);
+        assert_eq!(shadow_count(&[], 1000), None);
     }
 
     #[test]
-    fn session_log_roundtrip() {
-        let dir = std::env::temp_dir().join(format!("rpbot-test-{}", std::process::id()));
+    fn compaction_rotates_to_a_fresh_session_file() {
+        let dir = std::env::temp_dir().join(format!("rpbot-rot-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("session.jsonl");
-        let mut s = Session::load(&path).unwrap();
-        s.append(Message::system("sys")).unwrap();
+        let mut s = Session::load(&dir).unwrap();
         s.append(Message::user("hi")).unwrap();
-        s.compact(1, "user said hi".into()).unwrap();
-        // The in-memory surface must equal what a fresh replay produces.
-        assert_eq!(s.surface().len(), 2);
-        assert_eq!(s.surface()[0].role, Role::System);
-        assert!(s.surface()[1].text.contains("compacted-summary"));
+        s.append(Message::user("hello")).unwrap();
+        s.compact(2, "user said hi".into()).unwrap();
+        // The surface is now just the checkpoint; the old file is an archive.
+        assert_eq!(s.surface().len(), 1);
+        assert!(s.surface()[0].text.contains("<compacted-summary>"));
+        assert_eq!(std::fs::read_dir(dir.join("sessions")).unwrap().count(), 2);
         s.append(Message::user("more")).unwrap();
         drop(s);
-        let s = Session::load(&path).unwrap();
-        assert_eq!(s.surface().len(), 3);
-        assert!(s.surface()[1].text.contains("compacted-summary"));
-        assert_eq!(s.surface()[2].text, "more");
+        // A fresh load follows the pointer to the newest generation.
+        let s = Session::load(&dir).unwrap();
+        assert_eq!(s.surface().len(), 2);
+        assert!(s.surface()[0].text.contains("<compacted-summary>"));
+        assert_eq!(s.surface()[1].text, "more");
+        assert!(!dir.join("session.jsonl").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn legacy_log_migrates_and_drops_stored_prompt() {
+        let dir = std::env::temp_dir().join(format!("rpbot-mig-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let line = |op: &Op| serde_json::to_string(op).unwrap();
+        let ops = [
+            Op::Append { message: Message::system("old prompt") },
+            Op::Append { message: Message::user("hi") },
+            Op::Append { message: Message::user("hello") },
+            Op::Compact { shadowed: 2, summary: "greeted".into() },
+            Op::Append { message: Message::user("more") },
+        ];
+        std::fs::write(
+            dir.join("session.jsonl"),
+            ops.iter().map(&line).collect::<Vec<_>>().join("\n") + "\n",
+        )
+        .unwrap();
+
+        let s = Session::load(&dir).unwrap();
+        // No stored prompt, checkpoint preserved, tail kept.
+        assert_eq!(s.surface().len(), 2);
+        assert!(s.surface().iter().all(|m| m.role != Role::System));
+        assert!(s.surface()[0].text.contains("<compacted-summary>"));
+        assert_eq!(s.surface()[1].text, "more");
+        // The legacy file is renamed aside; the live state is in the new layout.
+        assert!(dir.join("session.jsonl.migrated").exists());
+        assert!(dir.join("current").exists());
+        assert_eq!(std::fs::read_dir(dir.join("sessions")).unwrap().count(), 1);
+        // Migration is one-shot: the next load reads the new layout.
+        drop(s);
+        let s = Session::load(&dir).unwrap();
+        assert_eq!(s.surface().len(), 2);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

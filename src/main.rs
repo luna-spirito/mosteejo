@@ -1,5 +1,6 @@
-//! Entry point: load config, verify Telegram identity, seed the system
-//! prompt, start the long-poll poller task and hand control to the agent.
+//! Entry point: load config (secrets via env or systemd credentials), verify
+//! Telegram identity, start the long-poll poller task and hand control to
+//! the agent.
 
 mod agent;
 mod config;
@@ -11,7 +12,7 @@ mod tools;
 use crate::agent::{Agent, Inbox};
 use crate::config::Config;
 use crate::llm::Llm;
-use crate::session::{Message, Session};
+use crate::session::Session;
 use crate::tg::{Telegram, Update, Verdict, WatchList};
 use anyhow::{Context, Result};
 use std::path::PathBuf;
@@ -48,10 +49,7 @@ async fn run(cfg: Config) -> Result<()> {
     std::fs::create_dir_all(&cfg.agent.state_dir).context("create state dir")?;
     let offset_path = PathBuf::from(&cfg.agent.state_dir).join("tg_offset");
 
-    let mut session = Session::load(&PathBuf::from(&cfg.agent.state_dir).join("session.jsonl"))?;
-    if session.surface().is_empty() {
-        session.append(Message::system(cfg.agent.system_prompt.clone().expect("resolved by config")))?;
-    }
+    let session = Session::load(&cfg.agent.state_dir)?;
 
     let watch = WatchList {
         allowed_users: cfg.telegram.allowed_users.iter().map(|u| u.id).collect(),

@@ -8,7 +8,7 @@
 
 use crate::config::Config;
 use crate::llm::{ChatError, ChatOptions, Llm, Reply};
-use crate::session::{Message, Session, ToolCall, estimate_tokens, message_tokens, shadow_count};
+use crate::session::{Message, Session, ToolCall, message_tokens, shadow_count};
 use crate::tg::{Attachment, Event, Telegram, WatchList};
 use crate::tools::Tools;
 use anyhow::{Result, anyhow};
@@ -382,12 +382,27 @@ impl Agent {
     }
 
     /// One model request. On success anchors the compaction metric to the
+    /// The full wire surface: the system prompt from config (never stored in
+    /// the session, so a restart applies a new prompt immediately) followed
+    /// by the session content.
+    fn composed(&self) -> Vec<Message> {
+        let mut msgs = Vec::with_capacity(1 + self.session.surface().len());
+        msgs.push(self.system_message());
+        msgs.extend_from_slice(self.session.surface());
+        msgs
+    }
+
+    fn system_message(&self) -> Message {
+        Message::system(self.cfg.agent.system_prompt.as_deref().unwrap_or_default())
+    }
+
+    /// One model request. On success anchors the compaction metric to the
     /// provider's own token count for this exact surface state.
     async fn request(&mut self) -> Result<Reply, ChatError> {
         let mark = self.session.surface().len();
         let reply = self
             .llm
-            .chat(self.session.surface(), &self.schemas, &self.chat_options())
+            .chat(&self.composed(), &self.schemas, &self.chat_options())
             .await?;
         if let Some(p) = reply.prompt_tokens {
             self.prompt_anchor = Some((mark, p));
@@ -419,7 +434,7 @@ impl Agent {
     async fn maybe_compact(&mut self, force: bool) -> Result<()> {
         let total = match self.prompt_anchor {
             Some((mark, prompt)) => prompt + self.session.tail_tokens(mark),
-            None => estimate_tokens(self.session.surface()),
+            None => self.session.tail_tokens(0) + message_tokens(&self.system_message()),
         };
         let threshold = self.cfg.llm.compaction_threshold_tokens;
         if !force && total < threshold {
@@ -472,7 +487,7 @@ impl Agent {
     /// request replays the surface verbatim, so the provider prefix cache
     /// stays warm and only the instruction is novel.
     async fn summarize(&self) -> Result<String> {
-        let mut scratch = self.session.surface().to_vec();
+        let mut scratch = self.composed();
         scratch.push(Message::user(COMPACTION_INSTRUCTION));
         loop {
             let reply = self
