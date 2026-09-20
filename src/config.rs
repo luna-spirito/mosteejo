@@ -124,18 +124,22 @@ impl Config {
         let mut cfg: Config = toml::from_str(&raw).context("parse config")?;
 
         if cfg.telegram.token.is_none() {
-            cfg.telegram.token = std::env::var("TELEGRAM_BOT_TOKEN").ok();
+            cfg.telegram.token = secret_from_credential("telegram_bot_token")
+                .or_else(|| std::env::var("TELEGRAM_BOT_TOKEN").ok());
         }
         anyhow::ensure!(
             cfg.telegram.token.is_some(),
-            "telegram token missing: set `telegram.token` or $TELEGRAM_BOT_TOKEN"
+            "telegram token missing: set `telegram.token`, $TELEGRAM_BOT_TOKEN, \
+             or a systemd credential `telegram_bot_token`"
         );
         if cfg.llm.api_key.is_none() {
-            cfg.llm.api_key = std::env::var("ZAI_API_KEY").ok();
+            cfg.llm.api_key = secret_from_credential("zai_api_key")
+                .or_else(|| std::env::var("ZAI_API_KEY").ok());
         }
         anyhow::ensure!(
             cfg.llm.api_key.is_some(),
-            "llm api key missing: set `llm.api_key` or $ZAI_API_KEY"
+            "llm api key missing: set `llm.api_key`, $ZAI_API_KEY, \
+             or a systemd credential `zai_api_key`"
         );
 
         if let Some(file) = &cfg.agent.system_prompt_file {
@@ -148,5 +152,34 @@ impl Config {
             "system prompt missing: set `agent.system_prompt` or `agent.system_prompt_file`"
         );
         Ok(cfg)
+    }
+}
+
+/// Read a secret from the systemd credentials directory (LoadCredential /
+/// LoadCredentialEncrypted mount it there). Trimmed: credential files almost
+/// always end with a newline.
+fn secret_from_credential(name: &str) -> Option<String> {
+    let dir = std::env::var_os("CREDENTIALS_DIRECTORY")?;
+    std::fs::read_to_string(Path::new(&dir).join(name))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn credential_file_is_trimmed_and_overridable() {
+        let dir = std::env::temp_dir().join("rp-cred-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("telegram_bot_token"), "123:abc\n").unwrap();
+        // SAFETY: tests run in-process; no other test reads this variable.
+        unsafe { std::env::set_var("CREDENTIALS_DIRECTORY", &dir) };
+        assert_eq!(secret_from_credential("telegram_bot_token").as_deref(), Some("123:abc"));
+        assert_eq!(secret_from_credential("missing"), None);
+        unsafe { std::env::remove_var("CREDENTIALS_DIRECTORY") };
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

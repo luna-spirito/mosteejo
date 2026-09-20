@@ -102,12 +102,14 @@ fn edit_schema() -> Value {
 fn send_message_schema() -> Value {
     schema(
         "send_message",
-        "Send a Telegram message. Long texts are split automatically. Plain text by default.",
+        "Send a Telegram message. `text` is Markdown: **bold**, *italic*, ~~strikethrough~~, \
+         `inline code`, fenced ``` code blocks ```, > blockquote, # headings, - lists, \
+         [link text](url). Telegram has no tables or inline images — they degrade to plain text. \
+         Long texts are split automatically at paragraph boundaries.",
         json!({
             "chat_id": { "type": "integer", "description": "Target chat id (a user id for DMs, a negative id for groups). Note that any message sent to the user's DM won't be visible for other users." },
             "thread_id": { "type": "integer", "description": "Forum topic (message_thread_id) to post into, if the chat has topics." },
-            "text": { "type": "string" },
-            "parse_mode": { "type": "string", "description": "Optional: HTML, MarkdownV2 or Markdown." },
+            "text": { "type": "string", "description": "Message text, Markdown." },
             "reply_to_message_id": { "type": "integer", "description": "Optional message to reply to." }
         }),
         &["chat_id", "text"],
@@ -303,13 +305,14 @@ impl<'a> Tools<'a> {
             return err_arg("chat_id, text");
         };
         let thread_id = args.get("thread_id").and_then(Value::as_i64);
-        let parse_mode = args.get("parse_mode").and_then(Value::as_str);
         let reply_to = args.get("reply_to_message_id").and_then(Value::as_i64);
+        // Split the Markdown source, then render each chunk separately: every
+        // chunk's HTML is balanced on its own, so a construct spanning a split
+        // degrades to literal text instead of a rejected message.
         let chunks = split_text(text, TELEGRAM_LIMIT);
         for chunk in &chunks {
-            if let Err(e) = tg
-                .send_message(chat_id, thread_id, chunk, parse_mode, reply_to)
-                .await
+            let html = crate::tg::render_markdown(chunk);
+            if let Err(e) = tg.send_message(chat_id, thread_id, &html, Some("HTML"), reply_to).await
             {
                 return format!("Error: {e}");
             }

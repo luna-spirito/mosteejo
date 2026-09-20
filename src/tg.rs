@@ -5,6 +5,7 @@
 
 use anyhow::{Context, Result, anyhow};
 use base64::Engine;
+use pulldown_cmark::{Event as MdEvent, Options, Parser, Tag, TagEnd};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -280,9 +281,121 @@ impl Telegram {
     }
 }
 
+/// Render model-authored Markdown into the HTML dialect Telegram accepts
+/// (`parse_mode: "HTML"`). The output is always balanced regardless of what
+/// the model wrote, so sendMessage never fails on entity parsing; constructs
+/// Telegram cannot display (tables, raw HTML, inline images) degrade to text.
+pub fn render_markdown(src: &str) -> String {
+    let mut out = String::new();
+    let mut lists: Vec<Option<u64>> = Vec::new();
+    // Strikethrough on; tables stay off on purpose — Telegram cannot show them.
+    let parser = Parser::new_ext(src, Options::ENABLE_STRIKETHROUGH);
+    for ev in parser {
+        match ev {
+            MdEvent::Start(tag) => match tag {
+                Tag::Paragraph => ensure_newline(&mut out),
+                Tag::Heading { .. } => {
+                    ensure_newline(&mut out);
+                    out.push_str("<b>");
+                }
+                Tag::Emphasis => out.push_str("<i>"),
+                Tag::Strong => out.push_str("<b>"),
+                Tag::Strikethrough => out.push_str("<s>"),
+                Tag::BlockQuote(_) => {
+                    ensure_newline(&mut out);
+                    out.push_str("<blockquote>");
+                }
+                Tag::CodeBlock(_) => {
+                    ensure_newline(&mut out);
+                    out.push_str("<pre>");
+                }
+                Tag::List(start) => lists.push(start),
+                Tag::Item => {
+                    ensure_newline(&mut out);
+                    match lists.last_mut() {
+                        Some(Some(n)) => {
+                            out.push_str(&format!("{n}. "));
+                            *n += 1;
+                        }
+                        _ => out.push_str("• "),
+                    }
+                }
+                Tag::Link { dest_url, .. } => {
+                    out.push_str(&format!("<a href=\"{}\">", escape_attr(&dest_url)))
+                }
+                Tag::Image { dest_url, .. } => {
+                    out.push_str(&format!("[<a href=\"{}\">", escape_attr(&dest_url)))
+                }
+                _ => {}
+            },
+            MdEvent::End(tag_end) => match tag_end {
+                TagEnd::Paragraph => out.push('\n'),
+                TagEnd::Heading(_) => out.push_str("</b>\n"),
+                TagEnd::Emphasis => out.push_str("</i>"),
+                TagEnd::Strong => out.push_str("</b>"),
+                TagEnd::Strikethrough => out.push_str("</s>"),
+                TagEnd::BlockQuote(_) => out.push_str("</blockquote>\n"),
+                TagEnd::CodeBlock => out.push_str("</pre>\n"),
+                TagEnd::Item => ensure_newline(&mut out),
+                TagEnd::List(_) => {
+                    lists.pop();
+                }
+                TagEnd::Link => out.push_str("</a>"),
+                TagEnd::Image => out.push_str("</a>]"),
+                _ => {}
+            },
+            MdEvent::Code(t) => out.push_str(&format!("<code>{}</code>", escape(&t))),
+            MdEvent::Text(t) => out.push_str(&escape(&t)),
+            MdEvent::SoftBreak | MdEvent::HardBreak => out.push('\n'),
+            MdEvent::Rule => {
+                ensure_newline(&mut out);
+                out.push_str("—\n");
+            }
+            MdEvent::TaskListMarker(done) => out.push_str(if done { "[x] " } else { "[ ] " }),
+            // Raw HTML is shown literally, never passed through: unknown tags
+            // would make Telegram reject the whole message.
+            MdEvent::Html(h) | MdEvent::InlineHtml(h) => out.push_str(&escape(&h)),
+            _ => {}
+        }
+    }
+    out.trim().to_string()
+}
+
+fn ensure_newline(out: &mut String) {
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+}
+
+fn escape(text: &str) -> String {
+    text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+fn escape_attr(text: &str) -> String {
+    escape(text).replace('"', "&quot;")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn markdown_renders_to_telegram_html() {
+        assert_eq!(
+            render_markdown("**b** *i* ~~s~~ `c`"),
+            "<b>b</b> <i>i</i> <s>s</s> <code>c</code>"
+        );
+        assert_eq!(render_markdown("[x](https://e.x)"), "<a href=\"https://e.x\">x</a>");
+        assert_eq!(render_markdown("- a\n- b\n1. c"), "• a\n• b\n1. c");
+        assert_eq!(render_markdown("# Head\ntext"), "<b>Head</b>\ntext");
+        assert_eq!(render_markdown("> quoted"), "<blockquote>\nquoted\n</blockquote>");
+        assert_eq!(render_markdown("```\n<x>\n```"), "<pre>&lt;x&gt;\n</pre>");
+        // Raw HTML and special chars never pass through unescaped.
+        assert_eq!(render_markdown("a <b> & c"), "a &lt;b&gt; &amp; c");
+        assert_eq!(render_markdown("<u>raw</u>"), "&lt;u&gt;raw&lt;/u&gt;");
+        // Unbalanced markers stay literal instead of producing broken HTML.
+        assert_eq!(render_markdown("2 * 3 ** 4"), "2 * 3 ** 4");
+    }
 
     fn update(from_id: Option<i64>, chat_kind: &str, chat_id: i64, thread: Option<i64>, text: &str) -> Update {
         Update {

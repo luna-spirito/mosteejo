@@ -6,12 +6,17 @@
       url = "github:oxalica/rust-overlay";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+    crane = {
+      url = "github:ipetkov/crane";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   outputs =
     inputs@{
       flake-parts,
       rust-overlay,
+      crane,
       nixpkgs,
       ...
     }:
@@ -42,7 +47,18 @@
               "rustfmt"
             ];
           };
-       in
+
+          # Crane builds dependencies as their own derivation (buildDepsOnly),
+          # so a source-only change rebuilds just rp-bot — the dep artifacts
+          # stay in the store across updates. This is what makes frequent
+          # deploys on a slow box (e.g. aarch64 microvm) viable.
+          craneLib = (crane.mkLib pkgs).overrideToolchain (_: rustToolchain);
+          src = craneLib.cleanCargoSource ./.;
+          cargoArtifacts = craneLib.buildDepsOnly { inherit src; };
+          rp-bot = craneLib.buildPackage {
+            inherit src cargoArtifacts;
+          };
+        in
         {
           devShells.default = pkgs.mkShell {
             name = "rust-nightly";
@@ -52,16 +68,20 @@
             ];
           };
 
-          packages.rp-bot = pkgs.rustPlatform.buildRustPackage {
-            pname = "rp-bot";
-            version = "0.1.0";
-            src = ./.;
-            cargoLock.lockFile = ./Cargo.lock;
-            cargo = rustToolchain;
-            rustc = rustToolchain;
-          };
+          packages.rp-bot = rp-bot;
+          packages.default = rp-bot;
 
-          packages.default = config.packages.rp-bot;
+          checks = {
+            rp-clippy = craneLib.cargoClippy {
+              inherit src cargoArtifacts;
+              cargoClippyExtraArgs = "--all-targets -- -Dwarnings";
+            };
+            rp-test = craneLib.cargoTest {
+              inherit src cargoArtifacts;
+            };
+          };
         };
+
+      flake.nixosModules.default = import ./module.nix;
     };
 }

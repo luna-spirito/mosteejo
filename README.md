@@ -59,6 +59,13 @@ poller (getUpdates) ──> фильтр ingress ──> inbox (очередь) 
 * **Медиа.** Фото скачиваются в `workspace/downloads/` и уходят в модель как
   image-блоки (data URL), документы — файлами на диске (агент читает их
   инструментами).
+* **Markdown в исходящих.** Модель пишет обычный Markdown, бот рендерит его в
+  HTML-диалект Telegram (`parse_mode: HTML`): `**жирный**`, `*курсив*`,
+  `~~зачёркнутый~~`, `` `код` ``, fenced-блоки кода, `>` цитаты, `#`-заголовки,
+  списки, `[текст](url)`. HTML-вывод всегда сбалансирован — Telegram не может
+  отклонить сообщение из-за разметки; таблицы и картинки в строке деградируют
+  в текст. Длинные тексты режутся по границам абзацев, каждая часть рендерится
+  независимо.
 * **Модель и reasoning effort.** Управление из чата: `/model` — показать
   текущую, `/model glm-5.3` — сменить модель, `/model glm-5.3-flash:high` —
   модель + effort, `/model :low` — только effort (GLM-5.3* понимает
@@ -89,6 +96,57 @@ cargo run -- rp.toml       # или: nix run
 Логи: `RUST_LOG=info` (по умолчанию), `RUST_LOG=debug` подробнее.
 
 Сборка пакетом: `nix build .#rp-bot`.
+
+## Развёртывание
+
+Флейк собирается через crane: зависимости строятся отдельной деривацией
+(`buildDepsOnly`), поэтому апдейт исходников пересобирает только сам `rp-bot`,
+а артефакты зависимостей остаются в store — частые обновления дешёвые даже на
+медленной машине. Пакет доступен для всех систем флейка, включая
+`aarch64-linux`: на сервере его достаточно собрать нативно
+(`packages.aarch64-linux.default` из вашего конфига-флейка) — кросс-компиляция
+и binfmt не нужны. В деривацию входят только исходники cargo
+(`cleanCargoSource`); конфиг (`rp.toml`), `state/` и `workspace/` живут рядом с
+процессом и настраиваются юнитом. Пример ссылки из NixOS-конфига:
+
+```nix
+# flake input:
+#   rp-bot.url = "github:<you>/rp-bot";  # или path:/srv/rp
+environment.systemPackages = [
+  rp-bot.packages.${pkgs.system}.default  # на aarch64-сервере соберётся нативно
+];
+```
+
+Чеки флейка (`nix flake check`) гоняют clippy (`-Dwarnings`) и тесты на тех же
+кэшированных зависимостях.
+
+Есть готовый NixOS-модуль (`rp-bot.nixosModules.default`, [module.nix](module.nix)):
+конфигурация описывается опциями `services.rp-bot.*` и рендерится в `rp.toml`
+без секретов (он попадает в world-readable store — см.
+`services.rp-bot.configFile`), а секреты передаются через systemd-механизм
+credential'ов:
+
+```nix
+services.rp-bot = {
+  enable = true;
+  package = rp-bot.packages.${pkgs.system}.default;
+  credentials = {
+    telegram_bot_token = config.age.secrets."tg-token".path;   # или sops/файл
+    zai_api_key = "/var/lib/secrets/zai.key";                  # или systemd-creds encrypt
+  };
+  telegram.allowedUsers = [{ id = 740313423; name = "Luna"; }];
+  telegram.subscribedTopics = [{ chatId = -1001234; threadId = 42; }];
+  agent.systemPrompt = ''
+    Ты — трактирщик в фэнтезийной таверне. Веди сцену, не пиши за игроков.
+  '';
+  llm.reasoningEffort = "low";
+};
+```
+
+Бот читает секреты из `$CREDENTIALS_DIRECTORY` (`LoadCredential`), env-переменные
+`TELEGRAM_BOT_TOKEN`/`ZAI_API_KEY` — запасной путь для локальной разработки.
+Юнит жёстко sandbox'ится (DynamicUser, ProtectSystem=strict и т.д.); bash-инструмент
+агента работает внутри той же песочницы — писать он может только в workspace.
 
 Куда смотреть при запуске:
 * `state/session.jsonl` — вся история операций сессии;
