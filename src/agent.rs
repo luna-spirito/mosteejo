@@ -6,12 +6,12 @@
 //! the conversation as one user message, then a normal turn runs
 //! (LLM <-> tools) until the model stops calling tools.
 
-use crate::chats::Chats;
+use crate::channels::Channels;
 use crate::config::Config;
 use crate::llm::{ChatError, ChatOptions, Llm, Reply};
 use crate::session::{Message, Session, ToolCall, message_tokens, shadow_count};
 use crate::tg::{
-    Attachment, Event, EventKind, MessageReaction, ReactionType, Telegram, WatchList, timestamp,
+    Attachment, Event, EventKind, MessageReaction, Telegram, WatchList, render_reactions, timestamp,
 };
 use crate::tools::Tools;
 use anyhow::{Result, anyhow};
@@ -172,7 +172,7 @@ pub struct Agent {
     session: Session,
     inbox: Inbox,
     watch: WatchList,
-    chats: Chats,
+    channels: Channels,
     schemas: Value,
     choice: ModelChoice,
     last_wake: Instant,
@@ -191,7 +191,7 @@ impl Agent {
         session: Session,
         inbox: Inbox,
         watch: WatchList,
-        chats: Chats,
+        channels: Channels,
     ) -> Self {
         let schemas = crate::tools::schemas();
         let choice = ModelChoice::load(
@@ -200,19 +200,33 @@ impl Agent {
             cfg.llm.reasoning_effort.as_deref(),
         );
         tracing::info!(model = %choice.model, effort = ?choice.effort, "model choice");
-        Self {
+        let mut agent = Self {
             cfg,
             llm,
             tg,
             session,
             inbox,
             watch,
-            chats,
+            channels,
             schemas,
             choice,
             last_wake: Instant::now(),
             prompt_anchor: None,
-        }
+        };
+        agent.seed_channels();
+        agent
+    }
+
+    /// Freeze the channel list into the session head: byte-stable within a
+    /// session generation (prefix-cache friendly), re-scanned at startup and
+    /// after every compaction. Resolution in tools always uses the live
+    /// registry, so channels discovered mid-session are addressable at once.
+    fn seed_channels(&mut self) {
+        self.session.set_head(Message::user(format!(
+            "[Telegram channels] Address send_message/edit_message by these exact names. \
+             Every channel's history is appended to workspace/chat/<name>.log — grep it for context.\n\n{}",
+            self.channels.list()
+        )));
     }
 
     pub async fn run(mut self) -> Result<()> {
@@ -232,7 +246,7 @@ impl Agent {
                 }
             }
 
-            let (text, images) = format_events(&roleplay, asleep);
+            let (text, images) = format_events(&roleplay, asleep, &self.channels);
             let wake = match text {
                 Some(text) => Message::user_with_images(text, images),
                 None if self.cfg.agent.heartbeat => Message::user(HEARTBEAT),
@@ -262,7 +276,7 @@ impl Agent {
             }
             Err(usage) => usage,
         };
-        if let Err(e) = self
+        match self
             .tg
             .send_message(
                 msg.chat.id,
@@ -273,7 +287,11 @@ impl Agent {
             )
             .await
         {
-            tracing::warn!(error = %e, "model command reply failed");
+            Ok(id) => {
+                self.channels
+                    .log_sent((msg.chat.id, msg.message_thread_id), id, &reply);
+            }
+            Err(e) => tracing::warn!(error = %e, "model command reply failed"),
         }
     }
 
@@ -292,8 +310,8 @@ impl Agent {
     }
 
     /// Drain the buffered updates; already filtered at ingress, re-checked
-    /// here as defense in depth. Every passing update feeds the chat
-    /// registry and its history buffer.
+    /// here as defense in depth. Every passing update feeds the channel
+    /// registry and its log.
     async fn collect_events(&mut self) -> Vec<Event> {
         let downloads = PathBuf::from(&self.cfg.agent.workspace_dir).join("downloads");
         let mut events = Vec::new();
@@ -308,7 +326,7 @@ impl Agent {
                     tracing::debug!("dropped disallowed reaction");
                     continue;
                 }
-                self.chats.observe_chat(&reaction.chat);
+                self.channels.observe_reaction(reaction);
                 events.push(Event { kind: EventKind::Reaction(reaction.clone()) });
                 continue;
             }
@@ -329,7 +347,7 @@ impl Agent {
                     vec![]
                 }
             };
-            self.chats.observe_message(msg);
+            self.channels.observe_message(msg, update.edited());
             events.push(Event {
                 kind: EventKind::Message {
                     msg: msg.clone(),
@@ -366,7 +384,7 @@ impl Agent {
     fn tools(&self) -> Tools<'_> {
         Tools {
             tg: Some(&self.tg),
-            chats: &self.chats,
+            channels: &self.channels,
             workspace: &self.cfg.agent.workspace_dir,
         }
     }
@@ -405,13 +423,13 @@ impl Agent {
         }
     }
 
-    /// One model request. On success anchors the compaction metric to the
     /// The full wire surface: the system prompt from config (never stored in
-    /// the session, so a restart applies a new prompt immediately) followed
-    /// by the session content.
+    /// the session, so a restart applies a new prompt immediately), the
+    /// frozen channel list, then the session content.
     fn composed(&self) -> Vec<Message> {
-        let mut msgs = Vec::with_capacity(1 + self.session.surface().len());
+        let mut msgs = Vec::with_capacity(2 + self.session.surface().len());
         msgs.push(self.system_message());
+        msgs.extend(self.session.head().cloned());
         msgs.extend_from_slice(self.session.surface());
         msgs
     }
@@ -458,7 +476,11 @@ impl Agent {
     async fn maybe_compact(&mut self, force: bool) -> Result<()> {
         let total = match self.prompt_anchor {
             Some((mark, prompt)) => prompt + self.session.tail_tokens(mark),
-            None => self.session.tail_tokens(0) + message_tokens(&self.system_message()),
+            None => {
+                self.session.tail_tokens(0)
+                    + message_tokens(&self.system_message())
+                    + self.session.head().map(message_tokens).unwrap_or(0)
+            }
         };
         let threshold = self.cfg.llm.compaction_threshold_tokens;
         if !force && total < threshold {
@@ -495,7 +517,9 @@ impl Agent {
             return Ok(());
         }
         self.session.compact(shadowed, summary)?;
-        // The surface was replaced; the anchor described the old one.
+        // A fresh session generation: re-scan the channel list, and the
+        // anchor described the old surface anyway.
+        self.seed_channels();
         self.prompt_anchor = None;
         tracing::info!(
             shadowed,
@@ -551,47 +575,35 @@ fn format_user(u: &crate::tg::TgUser) -> String {
     }
 }
 
-fn render_reactions(reactions: &[ReactionType]) -> String {
-    if reactions.is_empty() {
-        return "(none)".into();
-    }
-    reactions
-        .iter()
-        .map(|r| r.emoji.clone().unwrap_or_else(|| format!("[{}]", r.kind)))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn describe_event(e: &Event) -> String {
+fn describe_event(e: &Event, channels: &Channels) -> String {
     match &e.kind {
         EventKind::Message { msg, edited, attachments } => {
-            describe_message(msg, *edited, attachments)
+            describe_message(msg, *edited, attachments, channels)
         }
-        EventKind::Reaction(r) => describe_reaction(r),
+        EventKind::Reaction(r) => describe_reaction(r, channels),
     }
 }
 
-fn describe_message(m: &crate::tg::TgMessage, edited: bool, attachments: &[Attachment]) -> String {
+fn describe_message(
+    m: &crate::tg::TgMessage,
+    edited: bool,
+    attachments: &[Attachment],
+    channels: &Channels,
+) -> String {
     let time = timestamp(m.date);
     let author = match &m.from {
         Some(u) => format_user(u),
         None => "service".to_string(),
     };
-    let chat = match (&m.chat.title, m.message_thread_id) {
-        (Some(title), Some(t)) => format!("{title} (chat {}, topic {t})", m.chat.id),
-        (Some(title), None) => format!("{title} (chat {})", m.chat.id),
-        (None, Some(t)) => format!("chat {}, topic {t}", m.chat.id),
-        (None, None) => format!("chat {}", m.chat.id),
-    };
+    let channel = channels.name_of((m.chat.id, m.message_thread_id));
     let reply_note = match m.reply_to_message.as_ref().map(|r| r.message_id) {
         Some(r) => format!(", reply to #{r}"),
         None => String::new(),
     };
     let edited_note = if edited { " (edited)" } else { "" };
     let mut out = format!(
-        "--- [{time}] {author} (user id {}) in {chat}, message #{}{edited_note}{reply_note}\n",
-        m.from.as_ref().map(|u| u.id).unwrap_or(0),
-        m.message_id,
+        "--- [{time}] {author} in {channel}, message #{}{edited_note}{reply_note}\n",
+        m.message_id
     );
     let body = m
         .text
@@ -611,13 +623,13 @@ fn describe_message(m: &crate::tg::TgMessage, edited: bool, attachments: &[Attac
     out
 }
 
-fn describe_reaction(r: &MessageReaction) -> String {
+fn describe_reaction(r: &MessageReaction, channels: &Channels) -> String {
     let actor = match &r.user {
         Some(u) => format_user(u),
         None => r
             .actor_chat
             .as_ref()
-            .map(|c| c.label())
+            .map(|c| c.display_name())
             .unwrap_or_else(|| "someone".into()),
     };
     let action = if r.new_reaction.is_empty() { "removed reaction on" } else { "reacted to" };
@@ -625,7 +637,7 @@ fn describe_reaction(r: &MessageReaction) -> String {
         "--- [{}] {actor} {action} message #{} in {}: {} (was: {})\n",
         timestamp(r.date),
         r.message_id,
-        r.chat.label(),
+        channels.name_of((r.chat.id, None)),
         render_reactions(&r.new_reaction),
         render_reactions(&r.old_reaction),
     )
@@ -633,13 +645,16 @@ fn describe_reaction(r: &MessageReaction) -> String {
 
 /// Render drained events as one user message: a single text block plus the
 /// downloaded images as vision blocks. `None` when nothing arrived. The
-/// header names the source chats so the agent sees at a glance which
-/// channel/topic each burst came from.
-fn format_events(events: &[Event], asleep: Duration) -> (Option<String>, Vec<String>) {
+/// header names the source channels so the agent sees at a glance which
+/// channel each burst came from.
+fn format_events(events: &[Event], asleep: Duration, channels: &Channels) -> (Option<String>, Vec<String>) {
     if events.is_empty() {
         return (None, vec![]);
     }
-    let mut sources: Vec<String> = events.iter().map(|e| e.chat().label()).collect();
+    let mut sources: Vec<String> = events
+        .iter()
+        .map(|e| channels.name_of(e.channel_key()))
+        .collect();
     sources.sort();
     sources.dedup();
     let mut text = format!(
@@ -650,7 +665,7 @@ fn format_events(events: &[Event], asleep: Duration) -> (Option<String>, Vec<Str
     );
     let mut images = Vec::new();
     for e in events {
-        text.push_str(&describe_event(e));
+        text.push_str(&describe_event(e, channels));
         text.push('\n');
         let EventKind::Message { attachments, .. } = &e.kind else { continue };
         for attachment in attachments {
@@ -705,6 +720,9 @@ mod tests {
                         id: -100,
                         kind: "supergroup".into(),
                         title: None,
+                        first_name: String::new(),
+                        last_name: String::new(),
+                        username: None,
                     },
                     message_thread_id: Some(42),
                     date: 0,
@@ -713,6 +731,8 @@ mod tests {
                     photo: vec![],
                     document: None,
                     reply_to_message: None,
+                    forum_topic_created: None,
+                    forum_topic_edited: None,
                 },
                 edited: false,
                 attachments: vec![],
@@ -727,6 +747,9 @@ mod tests {
                     id: -100,
                     kind: "supergroup".into(),
                     title: chat_title.map(str::to_string),
+                    first_name: String::new(),
+                    last_name: String::new(),
+                    username: None,
                 },
                 message_id: 7,
                 user: Some(crate::tg::TgUser {
@@ -739,12 +762,18 @@ mod tests {
                 actor_chat: None,
                 date: 0,
                 old_reaction: vec![],
-                new_reaction: vec![ReactionType {
+                new_reaction: vec![crate::tg::ReactionType {
                     kind: "emoji".into(),
                     emoji: Some(emoji.into()),
                 }],
             }),
         }
+    }
+
+    fn channels() -> Channels {
+        let dir = std::env::temp_dir().join("rp-agent-channel-tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        Channels::empty(&dir.join("state"), &dir)
     }
 
     #[test]
@@ -809,34 +838,77 @@ mod tests {
     }
 
     #[test]
-    fn header_names_source_chats() {
-        let mut a = event_with_text("one");
-        let EventKind::Message { msg, .. } = &mut a.kind else { unreachable!() };
-        msg.chat.title = Some("RP".into());
+    fn header_names_source_channels() {
+        let mut channels = channels();
+        let a = event_with_text("one");
+        let EventKind::Message { msg, .. } = &a.kind else { unreachable!() };
+        channels.observe_message(msg, false);
         let b = reaction_event(Some("News"), "🔥");
-        let (text, _) = format_events(&[a, b], Duration::from_secs(30));
+        let EventKind::Reaction(r) = &b.kind else { unreachable!() };
+        channels.observe_reaction(r);
+        let (text, _) = format_events(&[a, b], Duration::from_secs(30), &channels);
         let text = text.unwrap();
-        assert!(text.starts_with("[Telegram: 2 new update(s) from News, RP;"), "{text}");
+        assert!(text.starts_with("[Telegram: 2 new update(s) from News, topic 42;"), "{text}");
+    }
+
+    #[test]
+    fn events_are_described_with_channel_names() {
+        let dir = std::env::temp_dir().join("rp-agent-channel-tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut channels = Channels::empty(&dir.join("state"), &dir);
+        let text = describe_event(&event_with_text("scene"), &channels);
+        assert!(text.contains("in topic 42, message #1"), "{text}");
+        assert!(!text.contains("chat id"), "{text}");
+        assert!(!text.contains("user id"), "{text}");
+        // A DM resolves to the person's name, not a bare id.
+        let mut dm = event_with_text("hi");
+        let EventKind::Message { msg, .. } = &mut dm.kind else { unreachable!() };
+        msg.chat = crate::tg::TgChat {
+            id: 5,
+            kind: "private".into(),
+            title: None,
+            first_name: "Luna".into(),
+            last_name: "Spirito".into(),
+            username: None,
+        };
+        msg.message_thread_id = None;
+        channels.observe_message(msg, false);
+        let text = describe_event(&dm, &channels);
+        assert!(text.contains("in Luna Spirito, message #1"), "{text}");
     }
 
     #[test]
     fn reactions_are_described_for_the_model() {
-        let text = describe_event(&reaction_event(Some("News"), "🔥"));
+        let mut channels = channels();
+        let reaction = reaction_event(Some("News"), "🔥");
+        let EventKind::Reaction(r) = &reaction.kind else { unreachable!() };
+        channels.observe_reaction(r);
+        let text = describe_event(&reaction, &channels);
         assert!(text.contains("Alice (@alice) reacted to message #7 in News"), "{text}");
         assert!(text.contains("🔥 (was: (none))"), "{text}");
         // Empty new_reaction reads as removal.
         let removed = Event {
             kind: EventKind::Reaction(MessageReaction {
-                chat: crate::tg::TgChat { id: 1, kind: "private".into(), title: None },
+                chat: crate::tg::TgChat {
+                    id: 1,
+                    kind: "private".into(),
+                    title: None,
+                    first_name: String::new(),
+                    last_name: String::new(),
+                    username: None,
+                },
                 message_id: 7,
                 user: None,
                 actor_chat: None,
                 date: 0,
-                old_reaction: vec![ReactionType { kind: "emoji".into(), emoji: Some("👍".into()) }],
+                old_reaction: vec![crate::tg::ReactionType {
+                    kind: "emoji".into(),
+                    emoji: Some("👍".into()),
+                }],
                 new_reaction: vec![],
             }),
         };
-        let text = describe_event(&removed);
+        let text = describe_event(&removed, &channels);
         assert!(text.contains("removed reaction on message #7"), "{text}");
         assert!(text.contains("(was: 👍)"), "{text}");
     }

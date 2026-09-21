@@ -15,6 +15,15 @@ TG_SEED = [
             "message_thread_id": 42,
             "date": 1758000000,
             "text": "Привет! Начнём сцену в таверне.",
+            # Every non-reply message of a topic carries the hidden topic
+            # creation message — the bot learns the topic title from it.
+            "reply_to_message": {
+                "message_id": 2,
+                "from": {"id": 1, "is_bot": False, "first_name": "Alice"},
+                "chat": {"id": -100123, "type": "supergroup", "title": "RP"},
+                "date": 1757990000,
+                "forum_topic_created": {"name": "IC", "icon_color": 0x6FB9F0},
+            },
         },
     },
     {
@@ -37,6 +46,16 @@ TG_SEED = [
             "date": 1758000002,
             "old_reaction": [],
             "new_reaction": [{"type": "emoji", "emoji": "🔥"}],
+        },
+    },
+    {
+        "update_id": 103,
+        "message": {
+            "message_id": 13,
+            "from": {"id": 1, "is_bot": False, "first_name": "Luna", "last_name": "Spirito"},
+            "chat": {"id": 1, "type": "private", "first_name": "Luna", "last_name": "Spirito"},
+            "date": 1758000003,
+            "text": "Как продвигается сцена?",
         },
     },
 ]
@@ -104,7 +123,7 @@ class Llm(BaseHTTPRequestHandler):
                        "content": None, "tool_calls": [{
                 "id": "call_1", "type": "function",
                 "function": {"name": "send_message", "arguments": json.dumps({
-                    "chat_id": -100123, "thread_id": 42, "reply_to_message_id": 11,
+                    "channel": "IC", "reply_to_message_id": 11,
                     "text": "Трактирщик поднимает взгляд: *«Проходите, садитесь»*",
                 }, ensure_ascii=False)}}]}
         elif state["llm_calls"] == 2:
@@ -112,7 +131,7 @@ class Llm(BaseHTTPRequestHandler):
                        "content": None, "tool_calls": [{
                 "id": "call_2", "type": "function",
                 "function": {"name": "edit_message", "arguments": json.dumps({
-                    "chat_id": -100123, "message_id": 555,
+                    "channel": "IC", "message_id": 555,
                     "text": "Трактирщик отвечает на реакцию: *«Проходите, садитесь»* — и пододвигает кружку.",
                 }, ensure_ascii=False)}}]}
         else:

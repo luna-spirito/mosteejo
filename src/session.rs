@@ -185,6 +185,11 @@ pub fn shadow_count(msgs: &[Message], retain_tokens: u64) -> Option<usize> {
 /// which also keeps every file's size bounded.
 pub struct Session {
     surface: Vec<Message>,
+    /// Channel list composed into the head of every request, right after
+    /// the system prompt. Never stored in the ops log: it is derived from
+    /// the channel registry and re-scanned at startup and after compaction,
+    /// so it stays byte-stable (cache-friendly) within a session generation.
+    head: Option<Message>,
     state_dir: PathBuf,
     file: Option<(PathBuf, std::fs::File)>,
 }
@@ -213,7 +218,7 @@ impl Session {
         };
         let mut surface = surface;
         repair_dangling_calls(&mut surface);
-        Ok(Self { surface, state_dir: state_dir.to_path_buf(), file })
+        Ok(Self { surface, head: None, state_dir: state_dir.to_path_buf(), file })
     }
 
     /// Convert a legacy single-file log (system prompt stored at the head,
@@ -231,7 +236,7 @@ impl Session {
             surface.remove(0);
         }
         repair_dangling_calls(&mut surface);
-        let mut session = Self { surface, state_dir: state_dir.to_path_buf(), file: None };
+        let mut session = Self { surface, head: None, state_dir: state_dir.to_path_buf(), file: None };
         let carried = session.surface.clone();
         session.rotate_into(&carried)?;
         std::fs::rename(&legacy, state_dir.join("session.jsonl.migrated"))
@@ -266,6 +271,14 @@ impl Session {
 
     pub fn surface(&self) -> &[Message] {
         &self.surface
+    }
+
+    pub fn head(&self) -> Option<&Message> {
+        self.head.as_ref()
+    }
+
+    pub fn set_head(&mut self, message: Message) {
+        self.head = Some(message);
     }
 
     /// Estimated tokens of `surface[from..]`. Combined with the provider's
@@ -349,6 +362,7 @@ mod tests {
         ];
         let session = Session {
             surface: replay(ops),
+            head: None,
             state_dir: std::env::temp_dir(),
             file: None,
         };

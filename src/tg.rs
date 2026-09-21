@@ -86,6 +86,40 @@ pub struct TgMessage {
     pub document: Option<TgDocument>,
     #[serde(default)]
     pub reply_to_message: Option<Box<TgMessage>>,
+    /// Topic title, learned passively: the creation service message itself,
+    /// a rename, or (attached to every non-reply message of a topic) the
+    /// hidden topic-creation message referenced by `reply_to_message`.
+    #[serde(default)]
+    pub forum_topic_created: Option<ForumTopicCreated>,
+    #[serde(default)]
+    pub forum_topic_edited: Option<ForumTopicEdited>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ForumTopicCreated {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ForumTopicEdited {
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+impl TgMessage {
+    /// Topic title visible in this update, if any.
+    pub fn topic_title(&self) -> Option<&str> {
+        if let Some(t) = &self.forum_topic_created {
+            return Some(&t.name);
+        }
+        if let Some(t) = &self.forum_topic_edited {
+            return t.name.as_deref();
+        }
+        self.reply_to_message
+            .as_ref()
+            .and_then(|r| r.forum_topic_created.as_ref())
+            .map(|t| t.name.as_str())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -116,9 +150,30 @@ pub struct TgChat {
     pub kind: String,
     #[serde(default)]
     pub title: Option<String>,
+    // Private chats have no title; the person's name lives on the chat itself.
+    #[serde(default)]
+    pub first_name: String,
+    #[serde(default)]
+    pub last_name: String,
+    #[serde(default)]
+    pub username: Option<String>,
 }
 
 impl TgChat {
+    /// Person's name for private chats, falling back to the username and
+    /// then the bare id.
+    pub fn display_name(&self) -> String {
+        let name = format!("{} {}", self.first_name, self.last_name)
+            .trim_end()
+            .to_string();
+        if !name.is_empty() {
+            return name;
+        }
+        self.username
+            .clone()
+            .unwrap_or_else(|| format!("user {}", self.id))
+    }
+
     /// Displayable chat name: title when known, else the bare id.
     pub fn label(&self) -> String {
         self.title
@@ -242,12 +297,26 @@ pub enum EventKind {
 }
 
 impl Event {
-    pub fn chat(&self) -> &TgChat {
+    /// Channel address of the event: `(chat_id, topic)`. Reactions carry no
+    /// topic (API limitation), so they resolve to the chat-level channel.
+    pub fn channel_key(&self) -> (i64, Option<i64>) {
         match &self.kind {
-            EventKind::Message { msg, .. } => &msg.chat,
-            EventKind::Reaction(r) => &r.chat,
+            EventKind::Message { msg, .. } => (msg.chat.id, msg.message_thread_id),
+            EventKind::Reaction(r) => (r.chat.id, None),
         }
     }
+}
+
+/// Emoji list of a reaction, `[kind]` for custom ones, "(none)" when empty.
+pub fn render_reactions(reactions: &[ReactionType]) -> String {
+    if reactions.is_empty() {
+        return "(none)".into();
+    }
+    reactions
+        .iter()
+        .map(|r| r.emoji.clone().unwrap_or_else(|| format!("[{}]", r.kind)))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// UTC rendering of a Telegram unix date, shared by the event formatter and
@@ -624,6 +693,9 @@ mod tests {
                     id: chat_id,
                     kind: chat_kind.into(),
                     title: None,
+                    first_name: String::new(),
+                    last_name: String::new(),
+                    username: None,
                 },
                 message_thread_id: thread,
                 date: 0,
@@ -632,6 +704,8 @@ mod tests {
                 photo: vec![],
                 document: None,
                 reply_to_message: None,
+                forum_topic_created: None,
+                forum_topic_edited: None,
             }),
             edited_message: None,
             message_reaction: None,
@@ -648,6 +722,9 @@ mod tests {
                     id: chat_id,
                     kind: chat_kind.into(),
                     title: None,
+                    first_name: String::new(),
+                    last_name: String::new(),
+                    username: None,
                 },
                 message_id: 10,
                 user: from_id.map(|id| TgUser {
@@ -729,6 +806,9 @@ mod tests {
                 id: -100,
                 kind: "supergroup".into(),
                 title: None,
+                first_name: String::new(),
+                last_name: String::new(),
+                username: None,
             },
             message_thread_id: Some(9),
             date: 0,
@@ -737,6 +817,8 @@ mod tests {
             photo: vec![],
             document: None,
             reply_to_message: None,
+            forum_topic_created: None,
+            forum_topic_edited: None,
         }));
         assert_eq!(classify(&reply, &w), Verdict::Wake);
     }
@@ -793,6 +875,47 @@ mod tests {
         assert_eq!(r.new_reaction.len(), 2);
         assert_eq!(r.new_reaction[0].emoji.as_deref(), Some("🔥"));
         assert_eq!(r.old_reaction[0].emoji.as_deref(), Some("👍"));
+    }
+
+    #[test]
+    fn topic_title_is_learned_from_reply_to_message() {
+        // Any non-reply message of a topic carries the hidden topic-creation
+        // message in reply_to_message — the only passive source of the name.
+        let raw = r#"{"update_id": 6, "message": {
+            "message_id": 90, "from": {"id": 1, "is_bot": false, "first_name": "Luna"},
+            "chat": {"id": -100, "type": "supergroup", "title": "RP"},
+            "message_thread_id": 42, "date": 1758000003, "text": "scene",
+            "reply_to_message": {"message_id": 2,
+                                 "chat": {"id": -100, "type": "supergroup", "title": "RP"},
+                                 "date": 1758000000,
+                                 "forum_topic_created": {"name": "IC", "icon_color": 7322096}}
+        }}"#;
+        let update: Update = serde_json::from_str(raw).unwrap();
+        let msg = update.msg().unwrap();
+        assert_eq!(msg.topic_title(), Some("IC"));
+        assert_eq!(msg.message_thread_id, Some(42));
+    }
+
+    #[test]
+    fn private_chats_have_display_names() {
+        let chat = TgChat {
+            id: 5,
+            kind: "private".into(),
+            title: None,
+            first_name: "Luna".into(),
+            last_name: "Spirito".into(),
+            username: Some("luna".into()),
+        };
+        assert_eq!(chat.display_name(), "Luna Spirito");
+        let bare = TgChat {
+            id: 5,
+            kind: "private".into(),
+            title: None,
+            first_name: String::new(),
+            last_name: String::new(),
+            username: Some("luna".into()),
+        };
+        assert_eq!(bare.display_name(), "luna");
     }
 
     #[test]

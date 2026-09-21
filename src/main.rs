@@ -3,7 +3,7 @@
 //! the agent.
 
 mod agent;
-mod chats;
+mod channels;
 mod config;
 mod llm;
 mod session;
@@ -11,7 +11,7 @@ mod tg;
 mod tools;
 
 use crate::agent::{Agent, Inbox};
-use crate::chats::Chats;
+use crate::channels::Channels;
 use crate::config::Config;
 use crate::llm::Llm;
 use crate::session::Session;
@@ -91,8 +91,8 @@ async fn run(cfg: Config) -> Result<()> {
     ));
 
     let llm = Llm::new(&cfg.llm.base_url, cfg.llm.api_key.clone().expect("resolved by config"))?;
-    let chats = Chats::load(&cfg.agent.state_dir);
-    Agent::new(cfg, llm, tg, session, Inbox { rx, notify }, watch, chats)
+    let channels = Channels::load(&cfg.agent.state_dir, &cfg.agent.workspace_dir);
+    Agent::new(cfg, llm, tg, session, Inbox { rx, notify }, watch, channels)
         .run()
         .await
 }
