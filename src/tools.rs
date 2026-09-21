@@ -2,7 +2,8 @@
 //! fail — every outcome becomes model-readable text, so a tool error can
 //! never take down the turn.
 
-use crate::tg::Telegram;
+use crate::chats::Chats;
+use crate::tg::{Telegram, timestamp};
 use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -15,11 +16,14 @@ const READ_MAX_LINES: usize = 2000;
 const READ_MAX_LINE_CHARS: usize = 2000;
 const READ_MAX_BYTES: usize = 50 * 1024;
 const TELEGRAM_LIMIT: usize = 4000;
+const HISTORY_DEFAULT_LIMIT: usize = 20;
+const HISTORY_ENTRY_CHARS: usize = 1000;
 
 /// `tg` is `None` while compacting: the summarizer may keep notes on disk
 /// but must not be able to message anyone.
 pub struct Tools<'a> {
     pub tg: Option<&'a Telegram>,
+    pub chats: &'a Chats,
     pub workspace: &'a Path,
 }
 
@@ -30,6 +34,9 @@ pub fn schemas() -> Value {
         write_schema(),
         edit_schema(),
         send_message_schema(),
+        edit_message_schema(),
+        list_chats_schema(),
+        read_chat_schema(),
         // send_typing_schema(),
     ])
 }
@@ -91,7 +98,8 @@ fn send_message_schema() -> Value {
         "Send a Telegram message. `text` is Markdown: **bold**, *italic*, ~~strikethrough~~, \
          `inline code`, fenced ``` code blocks ```, > blockquote, # headings, - lists, \
          [link text](url). Telegram has no tables or inline images — they degrade to plain text. \
-         Long texts are split automatically at paragraph boundaries.",
+         Long texts are split automatically at paragraph boundaries. \
+         The reply reports the ids of the sent messages; pass one to edit_message to change it later.",
         json!({
             "chat_id": { "type": "integer", "description": "Target chat id (a user id for DMs, a negative id for groups). Note that any message sent to the user's DM won't be visible for other users." },
             "thread_id": { "type": "integer", "description": "Forum topic (message_thread_id) to post into, if the chat has topics." },
@@ -99,6 +107,43 @@ fn send_message_schema() -> Value {
             "reply_to_message_id": { "type": "integer", "description": "Optional message to reply to." }
         }),
         &["chat_id", "text"],
+    )
+}
+
+fn edit_message_schema() -> Value {
+    schema(
+        "edit_message",
+        "Replace the text of your own already sent Telegram message. `text` is Markdown, \
+         same as send_message, and must fit in a single message.",
+        json!({
+            "chat_id": { "type": "integer" },
+            "message_id": { "type": "integer", "description": "Id of YOUR message, as reported by send_message." },
+            "text": { "type": "string", "description": "Full replacement text, Markdown." }
+        }),
+        &["chat_id", "message_id", "text"],
+    )
+}
+
+fn list_chats_schema() -> Value {
+    schema(
+        "list_chats",
+        "List Telegram chats (groups, channels, DMs) the bot has seen activity in, with chat ids \
+         for send_message/edit_message.",
+        json!({}),
+        &[],
+    )
+}
+
+fn read_chat_schema() -> Value {
+    schema(
+        "read_chat",
+        "Read recently observed messages of a chat (rolling buffer, oldest first). \
+         Use list_chats to find chat ids.",
+        json!({
+            "chat_id": { "type": "integer", "description": "Chat id from list_chats." },
+            "limit": { "type": "integer", "description": "How many recent messages to show, default 20." }
+        }),
+        &["chat_id"],
     )
 }
 
@@ -144,6 +189,9 @@ impl<'a> Tools<'a> {
             "write_file" => self.write_file(&args),
             "edit_file" => self.edit_file(&args),
             "send_message" => self.send_message(&args).await,
+            "edit_message" => self.edit_message(&args).await,
+            "list_chats" => self.list_chats(),
+            "read_chat" => self.read_chat(&args),
             "send_typing" => self.send_typing(&args).await,
             other => format!("Error: unknown tool `{other}`."),
         }
@@ -296,18 +344,86 @@ impl<'a> Tools<'a> {
         // chunk's HTML is balanced on its own, so a construct spanning a split
         // degrades to literal text instead of a rejected message.
         let chunks = split_text(text, TELEGRAM_LIMIT);
+        let mut sent_ids = Vec::new();
         for chunk in &chunks {
             let html = crate::tg::render_markdown(chunk);
-            if let Err(e) = tg.send_message(chat_id, thread_id, &html, Some("HTML"), reply_to).await
-            {
-                return format!("Error: {e}");
+            match tg.send_message(chat_id, thread_id, &html, Some("HTML"), reply_to).await {
+                Ok(id) => sent_ids.push(id),
+                Err(e) => return format!("Error: {e}"),
             }
         }
         let target = match thread_id {
             Some(t) => format!("chat {chat_id} topic {t}"),
             None => format!("chat {chat_id}"),
         };
-        format!("Sent {} message(s) to {target}.", chunks.len())
+        let ids = sent_ids.iter().map(|id| format!("#{id}")).collect::<Vec<_>>().join(", ");
+        format!("Sent {} message(s) to {target}: {ids}.", chunks.len())
+    }
+
+    async fn edit_message(&self, args: &Value) -> String {
+        let Some(tg) = self.tg else {
+            return "Error: Telegram tools are unavailable right now.".into();
+        };
+        let (Some(text), Some(chat_id), Some(message_id)) = (
+            str_arg(args, "text"),
+            args.get("chat_id").and_then(Value::as_i64),
+            args.get("message_id").and_then(Value::as_i64),
+        ) else {
+            return err_arg("chat_id, message_id, text");
+        };
+        if text.len() > TELEGRAM_LIMIT {
+            return format!(
+                "Error: text is {} bytes, a single message holds at most {TELEGRAM_LIMIT}. \
+                 Shorten it or send a new message instead.",
+                text.len()
+            );
+        }
+        let html = crate::tg::render_markdown(text);
+        match tg.edit_message_text(chat_id, message_id, &html, Some("HTML")).await {
+            Ok(()) => format!("Edited message #{message_id} in chat {chat_id}."),
+            Err(e) => format!("Error: {e}"),
+        }
+    }
+
+    fn list_chats(&self) -> String {
+        let known = self.chats.known();
+        if known.is_empty() {
+            return "No chats observed yet.".into();
+        }
+        let mut out = String::from("Known chats:\n");
+        for (id, info) in known {
+            let title = info.title.as_deref().unwrap_or("(no title)");
+            out.push_str(&format!("- {title} ({}, id {id})\n", info.kind));
+        }
+        out
+    }
+
+    fn read_chat(&self, args: &Value) -> String {
+        let Some(chat_id) = args.get("chat_id").and_then(Value::as_i64) else {
+            return err_arg("chat_id");
+        };
+        let limit = args
+            .get("limit")
+            .and_then(Value::as_u64)
+            .unwrap_or(HISTORY_DEFAULT_LIMIT as u64)
+            .max(1) as usize;
+        let Some(entries) = self.chats.recent(chat_id, limit).filter(|e| !e.is_empty()) else {
+            return format!("No history recorded for chat {chat_id}.");
+        };
+        let mut out = format!("Recent messages in chat {chat_id} (oldest first):\n");
+        for e in entries {
+            let mut text = e.text.clone();
+            if text.chars().count() > HISTORY_ENTRY_CHARS {
+                text = text.chars().take(HISTORY_ENTRY_CHARS).collect::<String>() + "…";
+            }
+            out.push_str(&format!(
+                "[{}] #{} {}: {text}\n",
+                timestamp(e.date),
+                e.message_id,
+                e.author
+            ));
+        }
+        out
     }
 
     async fn send_typing(&self, args: &Value) -> String {
@@ -430,9 +546,16 @@ fn floor_char_boundary(s: &str, mut i: usize) -> usize {
 mod tests {
     use super::*;
 
-    fn tools(dir: &Path) -> Tools<'_> {
+    fn chat_store(dir: &Path) -> Chats {
+        let state = dir.join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        Chats::load(&state)
+    }
+
+    fn tools<'a>(dir: &'a Path, chats: &'a Chats) -> Tools<'a> {
         Tools {
             tg: None,
+            chats,
             workspace: dir,
         }
     }
@@ -446,6 +569,9 @@ mod tests {
             "write_file",
             "edit_file",
             "send_message",
+            "edit_message",
+            "list_chats",
+            "read_chat",
         ] {
             assert!(
                 all.as_array()
@@ -455,6 +581,51 @@ mod tests {
                 "missing {name}"
             );
         }
+    }
+
+    #[test]
+    fn chat_tools_reflect_observed_chats() {
+        let dir = std::env::temp_dir().join(format!("rpbot-chats-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        {
+            let state = dir.join("state");
+            std::fs::create_dir_all(&state).unwrap();
+            let mut chats = Chats::load(&state);
+            let mut m = crate::tg::TgMessage {
+                message_id: 5,
+                from: None,
+                chat: crate::tg::TgChat { id: -100, kind: "channel".into(), title: Some("News".into()) },
+                message_thread_id: None,
+                date: 1_758_000_000,
+                text: Some("announcement".into()),
+                caption: None,
+                photo: vec![],
+                document: None,
+                reply_to_message: None,
+            };
+            chats.observe_message(&m);
+            m.message_id = 6;
+            m.from = Some(crate::tg::TgUser {
+                id: 1,
+                is_bot: false,
+                first_name: "Alice".into(),
+                last_name: String::new(),
+                username: None,
+            });
+            m.text = Some("reply".into());
+            chats.observe_message(&m);
+        }
+        let store = chat_store(&dir);
+        let t = tools(&dir, &store);
+        let out = t.list_chats();
+        assert!(out.contains("News (channel, id -100)"), "{out}");
+        let out = t.read_chat(&json!({ "chat_id": -100, "limit": 1 }));
+        assert!(out.contains("oldest first"), "{out}");
+        assert!(out.contains("#6 Alice: reply"), "{out}");
+        assert!(!out.contains("announcement"), "limit=1 must drop the oldest entry: {out}");
+        let out = t.read_chat(&json!({ "chat_id": -1 }));
+        assert!(out.starts_with("No history"), "{out}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -475,7 +646,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("f.txt");
         std::fs::write(&path, "aa bb aa").unwrap();
-        let t = tools(&dir);
+        let store = chat_store(&dir);
+        let t = tools(&dir, &store);
         let out = t.edit_file(&json!({ "path": "f.txt", "old_string": "aa", "new_string": "cc" }));
         assert!(out.contains("occurs 2 times"), "{out}");
         let out = t.edit_file(&json!({ "path": "f.txt", "old_string": "aa", "new_string": "cc", "replace_all": true }));
@@ -488,7 +660,8 @@ mod tests {
     fn write_then_read_roundtrip() {
         let dir = std::env::temp_dir().join(format!("rpbot-tools2-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let t = tools(&dir);
+        let store = chat_store(&dir);
+        let t = tools(&dir, &store);
         let out = t.write_file(&json!({ "path": "notes/a.md", "content": "# Notes" }));
         assert!(out.starts_with("Wrote"), "{out}");
         let out = t.read_file(&json!({ "path": "notes/a.md" }));
@@ -499,7 +672,8 @@ mod tests {
     #[test]
     fn telegram_tools_offline_report_error() {
         let dir = std::env::temp_dir();
-        let t = tools(&dir);
+        let store = chat_store(&dir);
+        let t = tools(&dir, &store);
         let out = t.edit_file(&json!({ "path": "x", "old_string": "a", "new_string": "b" }));
         assert!(out.starts_with("Error:"));
         let out = tokio::runtime::Runtime::new()

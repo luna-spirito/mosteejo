@@ -28,8 +28,35 @@ TG_SEED = [
             "text": "/model glm-5.3:max",
         },
     },
+    {
+        "update_id": 102,
+        "message_reaction": {
+            "chat": {"id": -100123, "type": "supergroup", "title": "RP"},
+            "message_id": 11,
+            "user": {"id": 1, "is_bot": False, "first_name": "Alice", "username": "alice"},
+            "date": 1758000002,
+            "old_reaction": [],
+            "new_reaction": [{"type": "emoji", "emoji": "🔥"}],
+        },
+    },
 ]
 state = {"updates_sent": False, "llm_calls": 0}
+
+def record_llm_request(req):
+    with open("/tmp/rp-smoke/llm_requests.log", "a") as f:
+        f.write(json.dumps({
+            "model": req.get("model"),
+            "reasoning_effort": req.get("reasoning_effort"),
+            "thinking": req.get("thinking"),
+            "clear_thinking": req.get("clear_thinking"),
+            "tools": len(req.get("tools", [])),
+            "assistant_msgs_with_reasoning": sum(
+                1 for m in req.get("messages", []) if m.get("reasoning_content")
+            ),
+        }, ensure_ascii=False) + "\n")
+    # Full surface for inspecting how Telegram updates were rendered.
+    with open("/tmp/rp-smoke/llm_last_request.json", "w") as f:
+        json.dump(req, f, ensure_ascii=False, indent=1)
 
 class Tg(BaseHTTPRequestHandler):
     def log_message(self, *a): pass
@@ -48,8 +75,12 @@ class Tg(BaseHTTPRequestHandler):
                 result = []
         elif method == "sendMessage":
             with open("/tmp/rp-smoke/sends.log", "a") as f:
-                f.write(json.dumps(body, ensure_ascii=False) + "\n")
+                f.write(json.dumps({"method": "sendMessage", **body}, ensure_ascii=False) + "\n")
             result = {"message_id": 555}
+        elif method == "editMessageText":
+            with open("/tmp/rp-smoke/sends.log", "a") as f:
+                f.write(json.dumps({"method": "editMessageText", **body}, ensure_ascii=False) + "\n")
+            result = {"message_id": body.get("message_id")}
         elif method == "sendChatAction":
             result = True
         else:
@@ -66,18 +97,7 @@ class Llm(BaseHTTPRequestHandler):
     def do_POST(self):
         n = int(self.headers.get("content-length", 0))
         req = json.loads(self.rfile.read(n) or b"{}")
-        reasoning_in_history = sum(
-            1 for m in req.get("messages", []) if m.get("reasoning_content")
-        )
-        with open("/tmp/rp-smoke/llm_requests.log", "a") as f:
-            f.write(json.dumps({
-                "model": req.get("model"),
-                "reasoning_effort": req.get("reasoning_effort"),
-                "thinking": req.get("thinking"),
-                "clear_thinking": req.get("clear_thinking"),
-                "tools": len(req.get("tools", [])),
-                "assistant_msgs_with_reasoning": reasoning_in_history,
-            }, ensure_ascii=False) + "\n")
+        record_llm_request(req)
         state["llm_calls"] += 1
         if state["llm_calls"] == 1:
             message = {"role": "assistant", "reasoning_content": "(Думаю: поприветствовать гостей таверны.)",
@@ -87,8 +107,16 @@ class Llm(BaseHTTPRequestHandler):
                     "chat_id": -100123, "thread_id": 42, "reply_to_message_id": 11,
                     "text": "Трактирщик поднимает взгляд: *«Проходите, садитесь»*",
                 }, ensure_ascii=False)}}]}
+        elif state["llm_calls"] == 2:
+            message = {"role": "assistant", "reasoning_content": "(Правлю своё сообщение.)",
+                       "content": None, "tool_calls": [{
+                "id": "call_2", "type": "function",
+                "function": {"name": "edit_message", "arguments": json.dumps({
+                    "chat_id": -100123, "message_id": 555,
+                    "text": "Трактирщик отвечает на реакцию: *«Проходите, садитесь»* — и пододвигает кружку.",
+                }, ensure_ascii=False)}}]}
         else:
-            message = {"role": "assistant", "reasoning_content": "(Гость сел, сцена начата.)",
+            message = {"role": "assistant", "reasoning_content": "(Сцена начата, правка ушла.)",
                        "content": "(сцена начата)"}
         resp = json.dumps({
             "choices": [{"message": message, "finish_reason": "stop"}],

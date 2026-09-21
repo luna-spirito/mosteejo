@@ -1,15 +1,18 @@
 //! The agent runtime: wake-ups, turns, tool dispatch and compaction.
 //!
-//! Wake model: priority updates (DMs, subscribed topics, pings) signal an
-//! immediate wake; everything else waits for the idle tick. On every wake
-//! the whole buffered queue is replayed into the conversation as one user
-//! message, then a normal turn runs (LLM <-> tools) until the model stops
-//! calling tools.
+//! Wake model: priority updates (DMs, subscribed topics, pings there,
+//! reactions in them) signal an immediate wake; everything else waits for
+//! the idle tick. On every wake the whole buffered queue is replayed into
+//! the conversation as one user message, then a normal turn runs
+//! (LLM <-> tools) until the model stops calling tools.
 
+use crate::chats::Chats;
 use crate::config::Config;
 use crate::llm::{ChatError, ChatOptions, Llm, Reply};
 use crate::session::{Message, Session, ToolCall, message_tokens, shadow_count};
-use crate::tg::{Attachment, Event, Telegram, WatchList};
+use crate::tg::{
+    Attachment, Event, EventKind, MessageReaction, ReactionType, Telegram, WatchList, timestamp,
+};
 use crate::tools::Tools;
 use anyhow::{Result, anyhow};
 use serde_json::Value;
@@ -150,9 +153,8 @@ fn valid_model_name(name: &str) -> bool {
 }
 
 fn is_model_command(event: &Event) -> bool {
-    event
-        .msg
-        .text
+    let EventKind::Message { msg, .. } = &event.kind else { return false };
+    msg.text
         .as_deref()
         .map(|t| t.split_whitespace().next().map(|c| c.split('@').next()) == Some(Some("/model")))
         .unwrap_or(false)
@@ -170,6 +172,7 @@ pub struct Agent {
     session: Session,
     inbox: Inbox,
     watch: WatchList,
+    chats: Chats,
     schemas: Value,
     choice: ModelChoice,
     last_wake: Instant,
@@ -188,6 +191,7 @@ impl Agent {
         session: Session,
         inbox: Inbox,
         watch: WatchList,
+        chats: Chats,
     ) -> Self {
         let schemas = crate::tools::schemas();
         let choice = ModelChoice::load(
@@ -203,6 +207,7 @@ impl Agent {
             session,
             inbox,
             watch,
+            chats,
             schemas,
             choice,
             last_wake: Instant::now(),
@@ -241,7 +246,7 @@ impl Agent {
     }
 
     async fn handle_model_command(&mut self, event: Event) {
-        let msg = &event.msg;
+        let EventKind::Message { msg, .. } = &event.kind else { return };
         let reply = match parse_model_command(msg.text.as_deref().unwrap_or_default()) {
             Ok(ModelCommand::Status) => self.choice.describe(),
             Ok(ModelCommand::Set { model, effort }) => {
@@ -287,11 +292,26 @@ impl Agent {
     }
 
     /// Drain the buffered updates; already filtered at ingress, re-checked
-    /// here as defense in depth.
+    /// here as defense in depth. Every passing update feeds the chat
+    /// registry and its history buffer.
     async fn collect_events(&mut self) -> Vec<Event> {
         let downloads = PathBuf::from(&self.cfg.agent.workspace_dir).join("downloads");
         let mut events = Vec::new();
         while let Ok(update) = self.inbox.rx.try_recv() {
+            if let Some(reaction) = &update.message_reaction {
+                let allowed = match (&reaction.user, &reaction.actor_chat) {
+                    (Some(u), _) => !u.is_bot && self.watch.allowed_users.contains(&u.id),
+                    (None, Some(c)) => self.watch.allowed_users.contains(&c.id),
+                    (None, None) => false,
+                };
+                if !allowed {
+                    tracing::debug!("dropped disallowed reaction");
+                    continue;
+                }
+                self.chats.observe_chat(&reaction.chat);
+                events.push(Event { kind: EventKind::Reaction(reaction.clone()) });
+                continue;
+            }
             let Some(msg) = update.msg() else { continue };
             let allowed = msg
                 .from
@@ -309,10 +329,13 @@ impl Agent {
                     vec![]
                 }
             };
+            self.chats.observe_message(msg);
             events.push(Event {
-                msg: msg.clone(),
-                edited: update.edited(),
-                attachments,
+                kind: EventKind::Message {
+                    msg: msg.clone(),
+                    edited: update.edited(),
+                    attachments,
+                },
             });
         }
         events
@@ -343,6 +366,7 @@ impl Agent {
     fn tools(&self) -> Tools<'_> {
         Tools {
             tg: Some(&self.tg),
+            chats: &self.chats,
             workspace: &self.cfg.agent.workspace_dir,
         }
     }
@@ -520,16 +544,37 @@ impl Agent {
     }
 }
 
+fn format_user(u: &crate::tg::TgUser) -> String {
+    match &u.username {
+        Some(handle) => format!("{} (@{handle})", u.display_name()),
+        None => u.display_name(),
+    }
+}
+
+fn render_reactions(reactions: &[ReactionType]) -> String {
+    if reactions.is_empty() {
+        return "(none)".into();
+    }
+    reactions
+        .iter()
+        .map(|r| r.emoji.clone().unwrap_or_else(|| format!("[{}]", r.kind)))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn describe_event(e: &Event) -> String {
-    let m = &e.msg;
-    let time = chrono::DateTime::from_timestamp(m.date, 0)
-        .map(|t| t.format("%Y-%m-%d %H:%M:%S UTC").to_string())
-        .unwrap_or_default();
+    match &e.kind {
+        EventKind::Message { msg, edited, attachments } => {
+            describe_message(msg, *edited, attachments)
+        }
+        EventKind::Reaction(r) => describe_reaction(r),
+    }
+}
+
+fn describe_message(m: &crate::tg::TgMessage, edited: bool, attachments: &[Attachment]) -> String {
+    let time = timestamp(m.date);
     let author = match &m.from {
-        Some(u) => match &u.username {
-            Some(handle) => format!("{} (@{handle})", u.display_name()),
-            None => u.display_name(),
-        },
+        Some(u) => format_user(u),
         None => "service".to_string(),
     };
     let chat = match (&m.chat.title, m.message_thread_id) {
@@ -542,7 +587,7 @@ fn describe_event(e: &Event) -> String {
         Some(r) => format!(", reply to #{r}"),
         None => String::new(),
     };
-    let edited_note = if e.edited { " (edited)" } else { "" };
+    let edited_note = if edited { " (edited)" } else { "" };
     let mut out = format!(
         "--- [{time}] {author} (user id {}) in {chat}, message #{}{edited_note}{reply_note}\n",
         m.from.as_ref().map(|u| u.id).unwrap_or(0),
@@ -555,7 +600,7 @@ fn describe_event(e: &Event) -> String {
         .unwrap_or_else(|| "(no text)".into());
     out.push_str(&body);
     out.push('\n');
-    for a in &e.attachments {
+    for a in attachments {
         let kind = if a.is_image { "image" } else { "file" };
         let size = std::fs::metadata(&a.path).map(|md| md.len()).unwrap_or(0);
         out.push_str(&format!(
@@ -566,22 +611,49 @@ fn describe_event(e: &Event) -> String {
     out
 }
 
+fn describe_reaction(r: &MessageReaction) -> String {
+    let actor = match &r.user {
+        Some(u) => format_user(u),
+        None => r
+            .actor_chat
+            .as_ref()
+            .map(|c| c.label())
+            .unwrap_or_else(|| "someone".into()),
+    };
+    let action = if r.new_reaction.is_empty() { "removed reaction on" } else { "reacted to" };
+    format!(
+        "--- [{}] {actor} {action} message #{} in {}: {} (was: {})\n",
+        timestamp(r.date),
+        r.message_id,
+        r.chat.label(),
+        render_reactions(&r.new_reaction),
+        render_reactions(&r.old_reaction),
+    )
+}
+
 /// Render drained events as one user message: a single text block plus the
-/// downloaded images as vision blocks. `None` when nothing arrived.
+/// downloaded images as vision blocks. `None` when nothing arrived. The
+/// header names the source chats so the agent sees at a glance which
+/// channel/topic each burst came from.
 fn format_events(events: &[Event], asleep: Duration) -> (Option<String>, Vec<String>) {
     if events.is_empty() {
         return (None, vec![]);
     }
+    let mut sources: Vec<String> = events.iter().map(|e| e.chat().label()).collect();
+    sources.sort();
+    sources.dedup();
     let mut text = format!(
-        "[Telegram: {} new update(s); you were asleep for ~{}s]\n\n",
+        "[Telegram: {} new update(s) from {}; you were asleep for ~{}s]\n\n",
         events.len(),
+        sources.join(", "),
         asleep.as_secs()
     );
     let mut images = Vec::new();
     for e in events {
         text.push_str(&describe_event(e));
         text.push('\n');
-        for attachment in &e.attachments {
+        let EventKind::Message { attachments, .. } = &e.kind else { continue };
+        for attachment in attachments {
             if image_mime(&attachment.path).is_none() {
                 continue;
             }
@@ -625,24 +697,53 @@ mod tests {
 
     fn event_with_text(text: &str) -> Event {
         Event {
-            msg: crate::tg::TgMessage {
-                message_id: 1,
-                from: None,
+            kind: EventKind::Message {
+                msg: crate::tg::TgMessage {
+                    message_id: 1,
+                    from: None,
+                    chat: crate::tg::TgChat {
+                        id: -100,
+                        kind: "supergroup".into(),
+                        title: None,
+                    },
+                    message_thread_id: Some(42),
+                    date: 0,
+                    text: Some(text.into()),
+                    caption: None,
+                    photo: vec![],
+                    document: None,
+                    reply_to_message: None,
+                },
+                edited: false,
+                attachments: vec![],
+            },
+        }
+    }
+
+    fn reaction_event(chat_title: Option<&str>, emoji: &str) -> Event {
+        Event {
+            kind: EventKind::Reaction(MessageReaction {
                 chat: crate::tg::TgChat {
                     id: -100,
                     kind: "supergroup".into(),
-                    title: None,
+                    title: chat_title.map(str::to_string),
                 },
-                message_thread_id: Some(42),
+                message_id: 7,
+                user: Some(crate::tg::TgUser {
+                    id: 1,
+                    is_bot: false,
+                    first_name: "Alice".into(),
+                    last_name: String::new(),
+                    username: Some("alice".into()),
+                }),
+                actor_chat: None,
                 date: 0,
-                text: Some(text.into()),
-                caption: None,
-                photo: vec![],
-                document: None,
-                reply_to_message: None,
-            },
-            edited: false,
-            attachments: vec![],
+                old_reaction: vec![],
+                new_reaction: vec![ReactionType {
+                    kind: "emoji".into(),
+                    emoji: Some(emoji.into()),
+                }],
+            }),
         }
     }
 
@@ -705,5 +806,38 @@ mod tests {
         let att = |p: &std::path::Path| Attachment { path: p.to_path_buf(), is_image: false };
         assert!(image_data_url(&att(&png)).unwrap().starts_with("data:image/png;base64,"));
         assert_eq!(image_data_url(&att(&txt)), None);
+    }
+
+    #[test]
+    fn header_names_source_chats() {
+        let mut a = event_with_text("one");
+        let EventKind::Message { msg, .. } = &mut a.kind else { unreachable!() };
+        msg.chat.title = Some("RP".into());
+        let b = reaction_event(Some("News"), "🔥");
+        let (text, _) = format_events(&[a, b], Duration::from_secs(30));
+        let text = text.unwrap();
+        assert!(text.starts_with("[Telegram: 2 new update(s) from News, RP;"), "{text}");
+    }
+
+    #[test]
+    fn reactions_are_described_for_the_model() {
+        let text = describe_event(&reaction_event(Some("News"), "🔥"));
+        assert!(text.contains("Alice (@alice) reacted to message #7 in News"), "{text}");
+        assert!(text.contains("🔥 (was: (none))"), "{text}");
+        // Empty new_reaction reads as removal.
+        let removed = Event {
+            kind: EventKind::Reaction(MessageReaction {
+                chat: crate::tg::TgChat { id: 1, kind: "private".into(), title: None },
+                message_id: 7,
+                user: None,
+                actor_chat: None,
+                date: 0,
+                old_reaction: vec![ReactionType { kind: "emoji".into(), emoji: Some("👍".into()) }],
+                new_reaction: vec![],
+            }),
+        };
+        let text = describe_event(&removed);
+        assert!(text.contains("removed reaction on message #7"), "{text}");
+        assert!(text.contains("(was: 👍)"), "{text}");
     }
 }
