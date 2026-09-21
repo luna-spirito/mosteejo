@@ -245,10 +245,14 @@ impl Session {
         self.file = None;
         let dir = self.state_dir.join("sessions");
         std::fs::create_dir_all(&dir)?;
-        let name = format!(
-            "{}.jsonl",
-            chrono::Utc::now().format("%Y%m%dT%H%M%S%3f")
-        );
+        // Millisecond stamps collide when rotations land in the same instant
+        // (e.g. a compaction right after the first append) — probe for a free
+        // name instead of truncating the existing generation.
+        let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%S%3f").to_string();
+        let name = (0u32..)
+            .map(|n| if n == 0 { format!("{stamp}.jsonl") } else { format!("{stamp}.{n}.jsonl") })
+            .find(|name| !dir.join(name).exists())
+            .expect("unbounded probe over free names");
         let path = dir.join(&name);
         let mut file = std::fs::File::create(&path)
             .with_context(|| format!("create session file {}", path.display()))?;
