@@ -319,7 +319,10 @@ impl<'a> Tools<'a> {
         let mut sent_ids = Vec::new();
         for chunk in &chunks {
             let html = crate::tg::render_markdown(chunk);
-            match tg.send_message(chat_id, thread_id, &html, Some("HTML"), reply_to).await {
+            match tg
+                .send_message(chat_id, thread_id, &html, Some("HTML"), reply_to)
+                .await
+            {
                 Ok(id) => {
                     sent_ids.push(id);
                     self.channels.log_sent(key, id, chunk);
@@ -327,7 +330,11 @@ impl<'a> Tools<'a> {
                 Err(e) => return format!("Error: {e}"),
             }
         }
-        let ids = sent_ids.iter().map(|id| format!("#{id}")).collect::<Vec<_>>().join(", ");
+        let ids = sent_ids
+            .iter()
+            .map(|id| format!("#{id}"))
+            .collect::<Vec<_>>()
+            .join(", ");
         format!("Sent {} message(s) to {channel}: {ids}.", chunks.len())
     }
 

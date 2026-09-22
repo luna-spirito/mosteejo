@@ -32,7 +32,7 @@ Compaction/summarization triggered: you must condense the conversation above int
 You still should have all the tools available so that you can record important information into your working directory. At the end of your turn, you must provide a single message that entails all the information that needs to be passed down to the new agent (you with no memory besides the system prompt), so that it can pick up from where you left. New agent will be provided with the same system prompt, the same environment (e. g. filesystem) and the message, all the other information will get lost.
 
 Don't send any Telegram messages unless necessary.
-Be terse and concise.";
+Be as detailed as possible, proactively link files that might be needed for the new agent.";
 
 const HEARTBEAT: &str = "\
 [tick] Scheduled wake, no new Telegram messages. You may take autonomous actions (advance a scene, act for NPCs, tidy up your notes) or do nothing at all. You probably shouldn't overthink and just do nothing at all.";
@@ -153,7 +153,9 @@ fn valid_model_name(name: &str) -> bool {
 }
 
 fn is_model_command(event: &Event) -> bool {
-    let EventKind::Message { msg, .. } = &event.kind else { return false };
+    let EventKind::Message { msg, .. } = &event.kind else {
+        return false;
+    };
     msg.text
         .as_deref()
         .map(|t| t.split_whitespace().next().map(|c| c.split('@').next()) == Some(Some("/model")))
@@ -260,7 +262,9 @@ impl Agent {
     }
 
     async fn handle_model_command(&mut self, event: Event) {
-        let EventKind::Message { msg, .. } = &event.kind else { return };
+        let EventKind::Message { msg, .. } = &event.kind else {
+            return;
+        };
         let reply = match parse_model_command(msg.text.as_deref().unwrap_or_default()) {
             Ok(ModelCommand::Status) => self.choice.describe(),
             Ok(ModelCommand::Set { model, effort }) => {
@@ -327,7 +331,9 @@ impl Agent {
                     continue;
                 }
                 self.channels.observe_reaction(reaction);
-                events.push(Event { kind: EventKind::Reaction(reaction.clone()) });
+                events.push(Event {
+                    kind: EventKind::Reaction(reaction.clone()),
+                });
                 continue;
             }
             let Some(msg) = update.msg() else { continue };
@@ -365,18 +371,6 @@ impl Agent {
             max_tokens: self.cfg.llm.max_output_tokens,
             temperature: self.cfg.llm.temperature,
             effort: self.choice.effort.as_deref(),
-            preserve_thinking: self.cfg.llm.preserve_thinking,
-        }
-    }
-
-    /// Compaction always summarizes at low effort, regardless of the
-    /// roleplay loop's current choice.
-    fn compaction_options(&self) -> ChatOptions<'_> {
-        ChatOptions {
-            model: &self.choice.model,
-            max_tokens: self.cfg.llm.max_output_tokens,
-            temperature: self.cfg.llm.temperature,
-            effort: Some("low"),
             preserve_thinking: self.cfg.llm.preserve_thinking,
         }
     }
@@ -540,7 +534,7 @@ impl Agent {
         loop {
             let reply = self
                 .llm
-                .chat(&scratch, &self.schemas, &self.compaction_options())
+                .chat(&scratch, &self.schemas, &self.chat_options())
                 .await
                 .map_err(|e| anyhow!("summarizer request failed: {e}"))?;
             let calls = reply.tool_calls.clone();
@@ -577,9 +571,11 @@ fn format_user(u: &crate::tg::TgUser) -> String {
 
 fn describe_event(e: &Event, channels: &Channels) -> String {
     match &e.kind {
-        EventKind::Message { msg, edited, attachments } => {
-            describe_message(msg, *edited, attachments, channels)
-        }
+        EventKind::Message {
+            msg,
+            edited,
+            attachments,
+        } => describe_message(msg, *edited, attachments, channels),
         EventKind::Reaction(r) => describe_reaction(r, channels),
     }
 }
@@ -632,7 +628,11 @@ fn describe_reaction(r: &MessageReaction, channels: &Channels) -> String {
             .map(|c| c.display_name())
             .unwrap_or_else(|| "someone".into()),
     };
-    let action = if r.new_reaction.is_empty() { "removed reaction on" } else { "reacted to" };
+    let action = if r.new_reaction.is_empty() {
+        "removed reaction on"
+    } else {
+        "reacted to"
+    };
     format!(
         "--- [{}] {actor} {action} message #{} in {}: {} (was: {})\n",
         timestamp(r.date),
@@ -647,7 +647,11 @@ fn describe_reaction(r: &MessageReaction, channels: &Channels) -> String {
 /// downloaded images as vision blocks. `None` when nothing arrived. The
 /// header names the source channels so the agent sees at a glance which
 /// channel each burst came from.
-fn format_events(events: &[Event], asleep: Duration, channels: &Channels) -> (Option<String>, Vec<String>) {
+fn format_events(
+    events: &[Event],
+    asleep: Duration,
+    channels: &Channels,
+) -> (Option<String>, Vec<String>) {
     if events.is_empty() {
         return (None, vec![]);
     }
@@ -667,7 +671,9 @@ fn format_events(events: &[Event], asleep: Duration, channels: &Channels) -> (Op
     for e in events {
         text.push_str(&describe_event(e, channels));
         text.push('\n');
-        let EventKind::Message { attachments, .. } = &e.kind else { continue };
+        let EventKind::Message { attachments, .. } = &e.kind else {
+            continue;
+        };
         for attachment in attachments {
             if image_mime(&attachment.path).is_none() {
                 continue;
@@ -832,8 +838,15 @@ mod tests {
         let txt = dir.join("note.txt");
         std::fs::write(&txt, b"plain text").unwrap();
 
-        let att = |p: &std::path::Path| Attachment { path: p.to_path_buf(), is_image: false };
-        assert!(image_data_url(&att(&png)).unwrap().starts_with("data:image/png;base64,"));
+        let att = |p: &std::path::Path| Attachment {
+            path: p.to_path_buf(),
+            is_image: false,
+        };
+        assert!(
+            image_data_url(&att(&png))
+                .unwrap()
+                .starts_with("data:image/png;base64,")
+        );
         assert_eq!(image_data_url(&att(&txt)), None);
     }
 
@@ -841,14 +854,21 @@ mod tests {
     fn header_names_source_channels() {
         let mut channels = channels();
         let a = event_with_text("one");
-        let EventKind::Message { msg, .. } = &a.kind else { unreachable!() };
+        let EventKind::Message { msg, .. } = &a.kind else {
+            unreachable!()
+        };
         channels.observe_message(msg, false);
         let b = reaction_event(Some("News"), "🔥");
-        let EventKind::Reaction(r) = &b.kind else { unreachable!() };
+        let EventKind::Reaction(r) = &b.kind else {
+            unreachable!()
+        };
         channels.observe_reaction(r);
         let (text, _) = format_events(&[a, b], Duration::from_secs(30), &channels);
         let text = text.unwrap();
-        assert!(text.starts_with("[Telegram: 2 new update(s) from News, topic 42;"), "{text}");
+        assert!(
+            text.starts_with("[Telegram: 2 new update(s) from News, topic 42;"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -862,7 +882,9 @@ mod tests {
         assert!(!text.contains("user id"), "{text}");
         // A DM resolves to the person's name, not a bare id.
         let mut dm = event_with_text("hi");
-        let EventKind::Message { msg, .. } = &mut dm.kind else { unreachable!() };
+        let EventKind::Message { msg, .. } = &mut dm.kind else {
+            unreachable!()
+        };
         msg.chat = crate::tg::TgChat {
             id: 5,
             kind: "private".into(),
@@ -881,10 +903,15 @@ mod tests {
     fn reactions_are_described_for_the_model() {
         let mut channels = channels();
         let reaction = reaction_event(Some("News"), "🔥");
-        let EventKind::Reaction(r) = &reaction.kind else { unreachable!() };
+        let EventKind::Reaction(r) = &reaction.kind else {
+            unreachable!()
+        };
         channels.observe_reaction(r);
         let text = describe_event(&reaction, &channels);
-        assert!(text.contains("Alice (@alice) reacted to message #7 in News"), "{text}");
+        assert!(
+            text.contains("Alice (@alice) reacted to message #7 in News"),
+            "{text}"
+        );
         assert!(text.contains("🔥 (was: (none))"), "{text}");
         // Empty new_reaction reads as removal.
         let removed = Event {
