@@ -167,32 +167,36 @@ environment.systemPackages = [
 Чеки флейка (`nix flake check`) гоняют clippy (`-Dwarnings`) и тесты на тех же
 кэшированных зависимостях.
 
-Есть готовый NixOS-модуль (`rp-bot.nixosModules.default`, [module.nix](module.nix)):
-конфигурация описывается опциями `services.rp-bot.*` и рендерится в `rp.toml`
+Есть готовый NixOS-модуль (`rp-bot.nixosModules.default`, [module.nix](module.nix)).
+Несколько ботов на одной машине описываются инстансами
+`services.rp-bots.instances.<name>` — каждый получает свой юнит
+`rp-bot-<name>` со своим `rp.toml`, секретами и state (по умолчанию
+`/var/lib/rp-bot/<name>/{workspace,state}`). Конфигурация рендерится в rp.toml
 без секретов (он попадает в world-readable store — см.
-`services.rp-bot.configFile`), а секреты передаются через systemd-механизм
+`instances.<name>.configFile`), а секреты передаются через systemd-механизм
 credential'ов:
 
 ```nix
-services.rp-bot = {
-  enable = true;
+services.rp-bots = {
   package = rp-bot.packages.${pkgs.system}.default;
-  credentials = {
-    telegram_bot_token = config.age.secrets."tg-token".path;   # или sops/файл
-    zai_api_key = "/var/lib/secrets/zai.key";                  # или systemd-creds encrypt
+  instances.tavern = {
+    credentials = {
+      telegram_bot_token = config.age.secrets."tg-token".path;   # или sops/файл
+      zai_api_key = "/var/lib/secrets/zai.key";                  # или systemd-creds encrypt
+    };
+    telegram.allowedUsers = [{ id = 740313423; name = "Luna"; }];
+    telegram.subscribedTopics = [{ chatId = -1001234; threadId = 42; }];
+    agent.systemPrompt = ''
+      Ты — трактирщик в фэнтезийной таверне. Веди сцену, не пиши за игроков.
+    '';
+    llm.reasoningEffort = "low";
   };
-  telegram.allowedUsers = [{ id = 740313423; name = "Luna"; }];
-  telegram.subscribedTopics = [{ chatId = -1001234; threadId = 42; }];
-  agent.systemPrompt = ''
-    Ты — трактирщик в фэнтезийной таверне. Веди сцену, не пиши за игроков.
-  '';
-  llm.reasoningEffort = "low";
 };
 ```
 
 Бот читает секреты из `$CREDENTIALS_DIRECTORY` (`LoadCredential`), env-переменные
 `TELEGRAM_BOT_TOKEN`/`ZAI_API_KEY` — запасной путь для локальной разработки.
-Юнит жёстко sandbox'ится (DynamicUser, ProtectSystem=strict и т.д.); bash-инструмент
+Юниты жёстко sandbox'ятся (DynamicUser, ProtectSystem=strict и т.д.); bash-инструмент
 агента работает внутри той же песочницы — писать он может только в workspace.
 
 Куда смотреть при запуске:
