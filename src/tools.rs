@@ -391,7 +391,7 @@ impl<'a> Tools<'a> {
         let Some(chat_id) = args.get("chat_id").and_then(Value::as_i64) else {
             return err_arg("chat_id");
         };
-        match tg.send_typing(chat_id).await {
+        match tg.send_typing(chat_id, None).await {
             Ok(()) => "Typing indicator shown.".into(),
             Err(e) => format!("Error: {e}"),
         }

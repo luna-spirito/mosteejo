@@ -11,7 +11,8 @@ use crate::config::Config;
 use crate::llm::{ChatError, ChatOptions, Llm, Reply};
 use crate::session::{Message, Session, ToolCall, message_tokens, shadow_count};
 use crate::tg::{
-    Attachment, Event, EventKind, MessageReaction, Telegram, WatchList, render_reactions, timestamp,
+    Attachment, Event, EventKind, MessageReaction, Telegram, Verdict, WatchList, render_reactions,
+    timestamp,
 };
 use crate::tools::Tools;
 use anyhow::{Result, anyhow};
@@ -36,6 +37,12 @@ Be as detailed as possible, proactively link files that might be needed for the 
 
 const HEARTBEAT: &str = "\
 [tick] Scheduled wake, no new Telegram messages. You may take autonomous actions (advance a scene, act for NPCs, tidy up your notes) or do nothing at all. You probably shouldn't overthink and just do nothing at all.";
+
+/// Quiet window after a wake, before the inbox is drained: Telegram clients
+/// split long outgoing messages into consecutive updates, and the tail of the
+/// burst can straddle long-poll batches. Settling coalesces the whole burst
+/// into one wake message instead of the bot latching onto its first fragment.
+const SETTLE: Duration = Duration::from_secs(2);
 
 /// Model + reasoning effort currently driving the main loop. Overridable at
 /// runtime via `/model`, persisted in the state dir across restarts.
@@ -236,6 +243,10 @@ impl Agent {
             self.wait_for_wake().await;
             let asleep = self.last_wake.elapsed();
             self.last_wake = Instant::now();
+            if !self.inbox.rx.is_empty() {
+                // Split-message fragments may still be in flight (see SETTLE).
+                tokio::time::sleep(SETTLE).await;
+            }
             let events = self.collect_events().await;
 
             // Control-plane commands never reach the model's context.
@@ -248,13 +259,17 @@ impl Agent {
                 }
             }
 
-            let (text, images) = format_events(&roleplay, asleep, &self.channels);
+            let (text, images) = format_events(&roleplay, Some(asleep), &self.channels);
             let wake = match text {
                 Some(text) => Message::user_with_images(text, images),
                 None if self.cfg.agent.heartbeat => Message::user(HEARTBEAT),
                 None => continue,
             };
             self.session.append(wake)?;
+            // «Bot is typing…» in every chat that woke the agent, refreshed
+            // for the whole turn — dropped (and with it the indicator) when
+            // the turn, tools and compaction included, is over.
+            let _typing = TypingGuard::start(self.tg.clone(), &typing_chats(&roleplay));
             if let Err(e) = self.run_turn().await {
                 tracing::error!(error = %e, "turn failed; will retry on next wake");
             }
@@ -320,6 +335,7 @@ impl Agent {
         let downloads = PathBuf::from(&self.cfg.agent.workspace_dir).join("downloads");
         let mut events = Vec::new();
         while let Ok(update) = self.inbox.rx.try_recv() {
+            let wake = crate::tg::classify(&update, &self.watch) == Verdict::Wake;
             if let Some(reaction) = &update.message_reaction {
                 let allowed = match (&reaction.user, &reaction.actor_chat) {
                     (Some(u), _) => !u.is_bot && self.watch.allowed_users.contains(&u.id),
@@ -333,6 +349,7 @@ impl Agent {
                 self.channels.observe_reaction(reaction);
                 events.push(Event {
                     kind: EventKind::Reaction(reaction.clone()),
+                    wake,
                 });
                 continue;
             }
@@ -360,6 +377,7 @@ impl Agent {
                     edited: update.edited(),
                     attachments,
                 },
+                wake,
             });
         }
         events
@@ -414,6 +432,9 @@ impl Agent {
                 return Ok(());
             }
             self.dispatch(&reply.tool_calls).await?;
+            // A long burst can straddle this turn: its tail rides along with
+            // the tool results, so the model answers both at once.
+            self.ingest_arrivals().await?;
         }
     }
 
@@ -456,6 +477,27 @@ impl Agent {
             tracing::info!(tool = %call.name, ms = started.elapsed().as_millis() as u64, "tool finished");
             self.session
                 .append(Message::tool_result(call.id.clone(), out))?;
+        }
+        Ok(())
+    }
+
+    /// Mid-turn injection: updates that arrived while the model was thinking
+    /// or tools were running are appended as a user message right after the
+    /// tool results, so the next request in the same turn sees both.
+    async fn ingest_arrivals(&mut self) -> Result<()> {
+        let events = self.collect_events().await;
+        let mut roleplay = Vec::new();
+        for event in events {
+            if is_model_command(&event) {
+                self.handle_model_command(event).await;
+            } else {
+                roleplay.push(event);
+            }
+        }
+        let (text, images) = format_events(&roleplay, None, &self.channels);
+        if let Some(text) = text {
+            self.session
+                .append(Message::user_with_images(text, images))?;
         }
         Ok(())
     }
@@ -646,10 +688,11 @@ fn describe_reaction(r: &MessageReaction, channels: &Channels) -> String {
 /// Render drained events as one user message: a single text block plus the
 /// downloaded images as vision blocks. `None` when nothing arrived. The
 /// header names the source channels so the agent sees at a glance which
-/// channel each burst came from.
+/// channel each burst came from; `asleep` is `None` for mid-turn injections,
+/// where the bot was working, not sleeping.
 fn format_events(
     events: &[Event],
-    asleep: Duration,
+    asleep: Option<Duration>,
     channels: &Channels,
 ) -> (Option<String>, Vec<String>) {
     if events.is_empty() {
@@ -661,12 +704,19 @@ fn format_events(
         .collect();
     sources.sort();
     sources.dedup();
-    let mut text = format!(
-        "[Telegram: {} new update(s) from {}; you were asleep for ~{}s]\n\n",
-        events.len(),
-        sources.join(", "),
-        asleep.as_secs()
-    );
+    let mut text = match asleep {
+        Some(d) => format!(
+            "[Telegram: {} new update(s) from {}; you were asleep for ~{}s]\n\n",
+            events.len(),
+            sources.join(", "),
+            d.as_secs()
+        ),
+        None => format!(
+            "[Telegram: {} new update(s) from {} arrived while you were working]\n\n",
+            events.len(),
+            sources.join(", ")
+        ),
+    };
     let mut images = Vec::new();
     for e in events {
         text.push_str(&describe_event(e, channels));
@@ -708,6 +758,55 @@ fn image_data_url(attachment: &Attachment) -> Option<String> {
     Some(Telegram::image_data_url(&bytes, mime))
 }
 
+/// Telegram's typing indicator fades after ~5 seconds; refresh it in a
+/// side task until the turn is fully over (guard dropped when run_turn
+/// returns). Held across the whole turn so the waking chat sees a
+/// continuous «bot writes…» through tool calls and intermediate messages.
+struct TypingGuard {
+    stop: Arc<Notify>,
+}
+
+impl TypingGuard {
+    fn start(tg: Telegram, chats: &[(i64, Option<i64>)]) -> Option<Self> {
+        if chats.is_empty() {
+            return None;
+        }
+        let chats = chats.to_vec();
+        let stop = Arc::new(Notify::new());
+        let signal = stop.clone();
+        tokio::spawn(async move {
+            loop {
+                for (chat, thread) in &chats {
+                    if let Err(e) = tg.send_typing(*chat, *thread).await {
+                        tracing::debug!(error = %e, "sendChatAction failed");
+                    }
+                }
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(4)) => {}
+                    _ = signal.notified() => return,
+                }
+            }
+        });
+        Some(Self { stop })
+    }
+}
+
+impl Drop for TypingGuard {
+    fn drop(&mut self) {
+        self.stop.notify_one();
+    }
+}
+
+/// Unique channels of the wake-class events — the chats that will see
+/// the typing indicator for the duration of the turn.
+fn typing_chats(events: &[Event]) -> Vec<(i64, Option<i64>)> {
+    let mut chats: Vec<(i64, Option<i64>)> =
+        events.iter().filter(|e| e.wake).map(|e| e.channel_key()).collect();
+    chats.sort();
+    chats.dedup();
+    chats
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -743,6 +842,7 @@ mod tests {
                 edited: false,
                 attachments: vec![],
             },
+            wake: true,
         }
     }
 
@@ -773,6 +873,7 @@ mod tests {
                     emoji: Some(emoji.into()),
                 }],
             }),
+            wake: false,
         }
     }
 
@@ -863,12 +964,42 @@ mod tests {
             unreachable!()
         };
         channels.observe_reaction(r);
-        let (text, _) = format_events(&[a, b], Duration::from_secs(30), &channels);
+        let (text, _) = format_events(&[a, b], Some(Duration::from_secs(30)), &channels);
         let text = text.unwrap();
         assert!(
             text.starts_with("[Telegram: 2 new update(s) from News, topic 42;"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn mid_turn_header_has_no_sleep_note() {
+        let channels = channels();
+        let (text, _) = format_events(&[event_with_text("late")], None, &channels);
+        let text = text.unwrap();
+        assert!(
+            text.starts_with("[Telegram: 1 new update(s) from topic 42 arrived while you were working]"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn typing_chats_filter_and_dedup() {
+        // Only wake-class events carry the indicator, keyed by full channel.
+        let mut side = reaction_event(Some("News"), "🔥"); // wake: false
+        let EventKind::Reaction(r) = &mut side.kind else {
+            unreachable!()
+        };
+        r.chat.id = -200;
+        let mut other_thread = event_with_text("hello");
+        let EventKind::Message { msg, .. } = &mut other_thread.kind else {
+            unreachable!()
+        };
+        msg.message_thread_id = Some(43);
+        let dup = event_with_text("again");
+        let chats = typing_chats(&[side, other_thread, dup, event_with_text("again")]);
+        assert_eq!(chats, vec![(-100, Some(42)), (-100, Some(43))]);
+        assert!(typing_chats(&[reaction_event(None, "🔥")]).is_empty());
     }
 
     #[test]
@@ -915,6 +1046,7 @@ mod tests {
         assert!(text.contains("🔥 (was: (none))"), "{text}");
         // Empty new_reaction reads as removal.
         let removed = Event {
+            wake: false,
             kind: EventKind::Reaction(MessageReaction {
                 chat: crate::tg::TgChat {
                     id: 1,

@@ -284,6 +284,10 @@ pub struct Attachment {
 #[derive(Debug)]
 pub struct Event {
     pub kind: EventKind,
+    /// Whether the ingress filter classifies this update as an immediate
+    /// wake (DM, subscribed topic, direct address) as opposed to passively
+    /// buffered chatter. Drives the turn-long typing indicator.
+    pub wake: bool,
 }
 
 #[derive(Debug)]
@@ -424,13 +428,14 @@ impl Telegram {
         self.call("editMessageText", &body).await.map(|_: Value| ())
     }
 
-    pub async fn send_typing(&self, chat_id: i64) -> Result<()> {
-        self.call(
-            "sendChatAction",
-            &json!({ "chat_id": chat_id, "action": "typing" }),
-        )
-        .await
-        .map(|_: Value| ())
+    pub async fn send_typing(&self, chat_id: i64, thread_id: Option<i64>) -> Result<()> {
+        let mut body = json!({ "chat_id": chat_id, "action": "typing" });
+        if let Some(t) = thread_id {
+            body["message_thread_id"] = json!(t);
+        }
+        self.call("sendChatAction", &body)
+            .await
+            .map(|_: Value| ())
     }
 
     async fn download(&self, file_id: &str) -> Result<Vec<u8>> {
